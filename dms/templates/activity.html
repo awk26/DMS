@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty, pagination with context %}
+{% block title %}Audit Log{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>Audit Log</h1><p class="muted">Who did what and when: documents, folders, permissions, sign-ins, administration and the email archive.</p></div></div>
+<form class="filters card" method="get">
+  <div class="field grow"><label for="aq">Search</label><input type="search" id="aq" name="q" value="{{ q }}" placeholder="Text or user"></div>
+  <div class="field"><label for="acat">Category</label>
+    <select id="acat" name="category"><option value="">All</option>{% for c in categories %}<option {{ 'selected' if c == category }}>{{ c }}</option>{% endfor %}</select></div>
+  <div class="field field-actions"><button class="btn btn-secondary">Filter</button></div>
+</form>
+{% if events %}
+<div class="card">
+  <ul class="timeline">
+    {% for a in events %}
+    <li><span class="tl-dot tl-{{ a.category }}"></span>
+      <span class="tl-text">
+        {% if a.entity_id and a.category == 'document' and a.action != 'purged' %}<a href="{{ url_for('documents.detail', doc_id=a.entity_id) }}">{{ a.message }}</a>
+        {% elif a.entity_id and a.category == 'email' %}<a href="{{ url_for('emails.detail', email_id=a.entity_id) }}">{{ a.message }}</a>
+        {% else %}{{ a.message }}{% endif %}
+        <small class="muted">· {{ a.category }} · {{ a.user_name or 'system' }}{% if a.ip %} · {{ a.ip }}{% endif %}</small>
+      </span>
+      <small class="muted nowrap">{{ a.created_at|dt }}</small></li>
+    {% endfor %}
+  </ul>
+</div>
+{{ pagination(page, pages, 'main.activity') }}
+{% else %}
+<div class="card">{% call empty('No activity found', '', 'activity') %}{% endcall %}</div>
+{% endif %}
+{% endblock %}

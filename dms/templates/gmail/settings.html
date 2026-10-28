@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, post_button with context %}
+{% block title %}Gmail{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Gmail connection</h1>
+    <p class="muted">Archive an email in Gmail and it is saved here as the complete original .eml message.</p>
+  </div>
+</div>
+
+{% set s = status %}
+{% set healthy = s.account and s.status in ('ok', 'never', 'partial') and s.token_present %}
+<div class="grid-2">
+  <section class="card">
+    <div class="card-head"><h2>Account</h2>
+      <span class="badge {{ 'badge-ok' if healthy else 'badge-warn' }}" data-gmail-badge>{{ 'Connected' if healthy else ('Action required' if s.account else 'Not connected') }}</span>
+    </div>
+    {% if not s.configured %}
+      <div class="notice notice-error">{{ icon('alert') }}<div><strong>OAuth client file missing.</strong> Place your Google OAuth client file at <code>credentials.json</code> in the application folder (see the setup guide), then reload this page.</div></div>
+    {% elif s.account and s.token_present %}
+      <dl class="meta">
+        <dt>Account</dt><dd class="break">{{ s.account }}</dd>
+        <dt>Permission</dt><dd>Read-only access to Gmail</dd>
+        <dt>Last check</dt><dd data-last-sync>{{ gmail_account.last_sync_at|dt if gmail_account.last_sync_at else 'Not yet' }}</dd>
+        <dt>Last success</dt><dd>{{ gmail_account.last_success_at|dt if gmail_account.last_success_at else '—' }}</dd>
+        <dt>Status</dt><dd data-sync-state>{{ {'ok': 'Healthy', 'never': 'Waiting for first check', 'partial': 'Some imports failed', 'reauth_required': 'Reconnection required', 'error': 'Error', 'network': 'Network error'}.get(s.status, s.status) }}</dd>
+      </dl>
+      {% if s.error %}<div class="notice notice-error">{{ icon('alert') }}<div>{{ s.error }}</div></div>{% endif %}
+      <div class="actions">
+        <form action="{{ url_for('gmail.sync_now') }}" method="post" data-sync-form class="inline-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="btn btn-primary" type="submit">{{ icon('refresh') }} Sync now</button>
+        </form>
+        {% if s.status == 'reauth_required' %}<a class="btn btn-secondary" href="{{ url_for('gmail.connect') }}">Reconnect</a>{% endif %}
+        {{ post_button(url_for('gmail.disconnect'), 'Disconnect', 'btn btn-ghost btn-danger-text', confirm='Disconnect Gmail? Automatic archiving stops; emails already archived stay in the DMS.') }}
+      </div>
+    {% else %}
+      <p>{% if s.account %}Access for <strong>{{ s.account }}</strong> has ended. Reconnect to resume archiving.{% else %}Connect the Gmail account whose archived emails should be stored in the DMS.{% endif %}</p>
+      <p class="muted small">You'll be asked to sign in with Google and grant read-only access. Access tokens are stored on the server only.</p>
+      <a class="btn btn-primary" href="{{ url_for('gmail.connect') }}">{{ icon('mail') }} {{ 'Reconnect Gmail' if s.account else 'Connect Gmail' }}</a>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>Automatic archiving</h2>
+      <span class="badge {{ 'badge-ok' if s.scheduler_running else 'badge-warn' }}">{{ 'Running' if s.scheduler_running else 'Stopped' }}</span>
+    </div>
+    <dl class="meta">
+      <dt>Check interval</dt><dd>Every {{ s.interval_seconds }} seconds</dd>
+      <dt>Archived emails</dt><dd>{{ s.archived_total }}</dd>
+      <dt>Waiting to import</dt><dd data-pending>{{ s.pending }}</dd>
+      <dt>Failed imports</dt><dd>{{ s.failed }}</dd>
+    </dl>
+    <p class="small muted">The application checks Gmail's change history on this interval and imports messages whose Inbox label was removed (archived). Emails appear in the DMS within one interval of being archived, while the application is running. Trashed or spam messages are not imported.</p>
+    {% if failed_items %}
+      <div class="notice notice-error">{{ icon('alert') }}<div>{{ failed_items|length }} message(s) failed to import. Last error: {{ failed_items[0].last_error }}</div></div>
+      {{ post_button(url_for('gmail.retry'), 'Retry failed imports', 'btn btn-secondary btn-sm', icon_name='refresh') }}
+    {% endif %}
+  </section>
+</div>
+
+<details class="card help">
+  <summary><strong>Connection help</strong></summary>
+  <ul class="small">
+    <li>The OAuth client in <code>credentials.json</code> must allow this redirect URI: <code>{{ redirect_uri }}</code> (Desktop clients accept localhost redirects automatically).</li>
+    <li>While the OAuth consent screen is in testing mode, only listed test users can connect.</li>
+    <li>If the browser connection is not possible, run <code>flask --app app gmail-connect</code> on the server.</li>
+  </ul>
+</details>
+{% endblock %}

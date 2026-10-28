@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, filetype, empty with context %}
+{% block title %}Recent{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>Recent</h1><p class="muted">Documents you opened recently, and the latest changes in the library.</p></div>
+</div>
+{% if viewed %}
+<section class="card">
+  <div class="card-head"><h2>Recently opened by you</h2></div>
+  <ul class="list compact">
+    {% for r in viewed %}{% set d = r.document %}
+    <li><a href="{{ url_for('documents.detail', doc_id=d.id) }}" class="list-row">{{ filetype(d.extension) }}
+      <span class="list-main"><span class="truncate">{{ d.name }}</span><small class="muted">{{ d.folder.path if d.folder else 'Root' }}</small></span>
+      <small class="muted nowrap">{{ r.viewed_at|dt('%d %b, %H:%M') }}</small></a></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+<h2>Recently uploaded or modified</h2>
+{% if documents %}
+<div class="card card-flush">{% with sortable=False %}{% with highlight_id=request.args.get('highlight', 0)|int %}{% include "documents/_table.html" %}{% endwith %}{% endwith %}</div>
+{% else %}
+<div class="card">{% call empty('No recent documents', 'Uploaded and updated documents appear here.', 'clock') %}
+  <button class="btn btn-primary btn-sm" data-modal-open="upload-modal">Upload document</button>{% endcall %}</div>
+{% endif %}
+{% endblock %}

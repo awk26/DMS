@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% block title %}Multi-factor authentication{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>Multi-factor authentication</h1></div></div>
+{% if recovery_codes %}
+<section class="card">
+  <h2>Your recovery codes</h2>
+  <p class="muted">Each code can be used once if you lose access to your authenticator app. Store them somewhere safe — they are not shown again.</p>
+  <pre class="preview-text">{{ recovery_codes|join('\n') }}</pre>
+  <a class="btn btn-primary" href="{{ url_for('main.dashboard') }}">Done</a>
+</section>
+{% elif user.mfa_enabled %}
+<section class="card"><p>{{ icon('shield') }} Multi-factor authentication is already on for your account.</p>
+  <a class="btn btn-ghost" href="{{ url_for('account.profile') }}">Back to my account</a></section>
+{% else %}
+<section class="card">
+  <h2>1. Scan this code with your authenticator app</h2>
+  <img src="{{ qr }}" alt="QR code for your authenticator app" width="200" height="200">
+  <p class="small muted">Can't scan? Enter this key manually: <code class="break">{{ secret }}</code></p>
+  <h2>2. Enter the 6-digit code it shows</h2>
+  <form method="post" action="{{ url_for('account.mfa_enable') }}" class="filters">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="field grow"><label for="code">Code</label><input type="text" id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required autofocus></div>
+    <div class="field field-actions"><button class="btn btn-primary" type="submit">Turn on MFA</button></div>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

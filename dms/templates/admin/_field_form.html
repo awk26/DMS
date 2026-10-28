@@ -1,0 +1,17 @@
+<form method="post" action="{{ url_for('admin.field_save') }}" class="pad">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  {% if field %}<input type="hidden" name="id" value="{{ field.id }}">{% endif %}
+  <div class="field"><label>Label</label><input type="text" name="label" value="{{ field.label if field else '' }}" required></div>
+  <div class="field"><label>Key</label><input type="text" name="name" value="{{ field.name if field else '' }}" required pattern="[a-z][a-z0-9_]*" placeholder="contract_number"></div>
+  <div class="field"><label>Type</label><select name="field_type">{% for k, l in field_types.items() %}<option value="{{ k }}" {{ 'selected' if field and field.field_type == k }}>{{ l }}</option>{% endfor %}</select></div>
+  <div class="field"><label>Vocabulary (choice fields)</label><select name="vocabulary_id"><option value="">—</option>{% for v in vocabularies %}<option value="{{ v.id }}" {{ 'selected' if field and field.vocabulary_id == v.id }}>{{ v.name }}</option>{% endfor %}</select></div>
+  <div class="field"><label>Document type</label><select name="document_type_id"><option value="">All types</option>{% for t in types %}<option value="{{ t.id }}" {{ 'selected' if field and field.document_type_id == t.id }}>{{ t.name }}</option>{% endfor %}</select></div>
+  <div class="field"><label>Folder</label><select name="folder_id"><option value="">All folders</option>{% for f, d in folders %}<option value="{{ f.id }}" {{ 'selected' if field and field.folder_id == f.id }}>{{ '  ' * d }}{{ f.name }}</option>{% endfor %}</select></div>
+  <div class="field"><label>Help text</label><input type="text" name="help_text" value="{{ field.help_text if field else '' }}"></div>
+  <div class="field"><label>Order</label><input type="text" name="sort_order" value="{{ field.sort_order if field else 0 }}" inputmode="numeric"></div>
+  <label class="check"><input type="checkbox" name="required" value="1" {{ 'checked' if field and field.required }}> Required at upload</label>
+  <div class="modal-actions">
+    {% if field %}<button class="btn btn-ghost btn-danger-text" name="action" value="delete" formnovalidate>Delete</button>{% endif %}
+    <button class="btn btn-primary btn-sm">Save field</button>
+  </div>
+</form>

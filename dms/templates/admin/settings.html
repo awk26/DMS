@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>Settings</h1><p class="muted">Policies applied across the repository. Changes take effect immediately.</p></div></div>
+{% include "admin/_nav.html" %}
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="grid-2">
+    <section class="card">
+      <h2>File types &amp; size limits</h2>
+      <div class="field"><label for="s-allowed">Allowed file types</label>
+        <textarea id="s-allowed" name="allowed_extensions" rows="5">{{ s.allowed_extensions|join(', ') }}</textarea>
+        <small class="muted">Extensions without the dot. Recognised types get a content check: {{ known|join(', ') }}.</small></div>
+      <div class="field"><label for="s-blocked">Blocked file types (always rejected)</label>
+        <textarea id="s-blocked" name="blocked_extensions" rows="3">{{ s.blocked_extensions|join(', ') }}</textarea></div>
+      <div class="field"><label for="s-max">Maximum file size (MB)</label>
+        <input type="text" id="s-max" name="max_upload_mb" value="{{ s.max_upload_mb }}" inputmode="numeric">
+        <small class="muted">Server maximum: {{ server_max }} MB (DMS_MAX_REQUEST_MB).</small></div>
+      <div class="field"><label for="s-limits">Per-type size limits (MB)</label>
+        <textarea id="s-limits" name="type_size_limits" rows="3" placeholder="mp4 = 500">{% for k, v in s.type_size_limits.items() %}{{ k }} = {{ v }}
+{% endfor %}</textarea></div>
+    </section>
+
+    <section class="card">
+      <h2>Repository</h2>
+      <div class="field"><label for="s-bin">Recycle bin retention (days)</label>
+        <input type="text" id="s-bin" name="recycle_bin_days" value="{{ s.recycle_bin_days }}" inputmode="numeric">
+        <small class="muted">Deleted folders and documents can be restored for this long (at least 30 days), then they are permanently deleted. Users can also empty their recycle bin at any time.</small></div>
+      <div class="field"><label for="s-fpat">Folder naming convention (regular expression, optional)</label>
+        <input type="text" id="s-fpat" name="folder_name_pattern" value="{{ s.folder_name_pattern }}" placeholder="e.g. [A-Z0-9][A-Za-z0-9 _-]*"></div>
+      <div class="field"><label for="s-dpat">Document naming convention (regular expression on the name without extension, optional)</label>
+        <input type="text" id="s-dpat" name="document_name_pattern" value="{{ s.document_name_pattern }}"></div>
+      <div class="field"><label for="s-len">Maximum name length</label>
+        <input type="text" id="s-len" name="name_max_length" value="{{ s.name_max_length }}" inputmode="numeric"></div>
+      <label class="check"><input type="checkbox" name="tags_controlled" value="1" {{ 'checked' if s.tags_controlled }}> Controlled tags: only tags approved under Metadata &amp; tags may be used</label>
+    </section>
+
+    <section class="card">
+      <h2>Versions</h2>
+      <div class="field"><label for="s-comment">Change comments</label>
+        <select id="s-comment" name="require_version_comment">
+          {% for v, l in [('none', 'Optional'), ('major', 'Required for major versions'), ('all', 'Required for every new version')] %}
+          <option value="{{ v }}" {{ 'selected' if s.require_version_comment == v }}>{{ l }}</option>{% endfor %}
+        </select></div>
+      <div class="field"><label for="s-keep">Keep the last N versions (0 = all)</label>
+        <input type="text" id="s-keep" name="version_keep_last" value="{{ s.version_keep_last }}" inputmode="numeric"></div>
+      <div class="field"><label for="s-years">Keep versions for X years (0 = forever)</label>
+        <input type="text" id="s-years" name="version_keep_years" value="{{ s.version_keep_years }}" inputmode="numeric">
+        <small class="muted">A version is kept while it is among the last N <em>or</em> younger than X years. The current version is never removed. Folders can override these rules.</small></div>
+    </section>
+
+    <section class="card">
+      <h2>Sign-in &amp; sessions</h2>
+      <label class="check"><input type="checkbox" name="self_signup" value="1" {{ 'checked' if s.self_signup }}> Let people create their own account from the sign-in page</label>
+      <div class="field"><label for="s-signup-role">Role for self-created accounts</label>
+        <select id="s-signup-role" name="signup_default_role">{% for r in roles if 'admin' not in r.capability_set and 'records' not in r.capability_set %}<option {{ 'selected' if r.name == s.signup_default_role }}>{{ r.name }}</option>{% endfor %}</select>
+        <small class="muted">Every user also gets a private My Files folder. Contributors can also see and add to the shared library.</small></div>
+      <label class="check"><input type="checkbox" name="mfa_required" value="1" {{ 'checked' if s.mfa_required }}> Require multi-factor authentication for local and LDAP accounts</label>
+      <div class="field"><label for="s-idle">Session idle timeout (minutes)</label>
+        <input type="text" id="s-idle" name="session_idle_minutes" value="{{ s.session_idle_minutes }}" inputmode="numeric"></div>
+      <div class="field"><label for="s-max-h">Maximum session length (hours)</label>
+        <input type="text" id="s-max-h" name="session_max_hours" value="{{ s.session_max_hours }}" inputmode="numeric"></div>
+      <div class="field"><label for="s-lock">Lock account after N failed sign-ins</label>
+        <input type="text" id="s-lock" name="lockout_threshold" value="{{ s.lockout_threshold }}" inputmode="numeric"></div>
+      <div class="field"><label for="s-lockm">Lockout duration (minutes)</label>
+        <input type="text" id="s-lockm" name="lockout_minutes" value="{{ s.lockout_minutes }}" inputmode="numeric"></div>
+      <label class="check"><input type="checkbox" name="sso_auto_provision" value="1" {{ 'checked' if s.sso_auto_provision }}> Create accounts automatically on first SSO / LDAP sign-in</label>
+      <div class="field"><label for="s-role">Default role for new SSO / LDAP users</label>
+        <select id="s-role" name="sso_default_role">{% for r in roles %}<option {{ 'selected' if r.name == s.sso_default_role }}>{{ r.name }}</option>{% endfor %}</select></div>
+      <div class="field"><label for="s-groups">Directory group → role mapping</label>
+        <textarea id="s-groups" name="group_role_map" rows="3" placeholder="DMS-Admins = Admin">{% for k, v in s.group_role_map.items() %}{{ k }} = {{ v }}
+{% endfor %}</textarea>
+        <small class="muted">Groups from LDAP (memberOf), OIDC (groups claim) or SAML (groups attribute). Mapped roles replace the user's roles at each sign-in.</small></div>
+    </section>
+
+    <section class="card">
+      <h2>Network &amp; device access</h2>
+      <div class="field"><label for="s-ip">Allowed IP addresses / ranges</label>
+        <textarea id="s-ip" name="ip_allowlist" rows="3" placeholder="10.0.0.0/8&#10;203.0.113.17">{{ s.ip_allowlist|join('\n') }}</textarea>
+        <small class="muted">Empty = any address. The server itself (localhost) is always allowed. Recovery: <code>flask --app app reset-security-policy</code>.</small></div>
+      <div class="field"><label for="s-dev">New devices</label>
+        <select id="s-dev" name="device_policy">
+          <option value="any" {{ 'selected' if s.device_policy == 'any' }}>Allowed automatically</option>
+          <option value="approval" {{ 'selected' if s.device_policy == 'approval' }}>Need administrator approval</option>
+        </select></div>
+      <fieldset class="field"><label>Blocked platforms</label>
+        {% for p in platforms %}<label class="check"><input type="checkbox" name="blocked_platforms" value="{{ p }}" {{ 'checked' if p in s.blocked_platforms }}> {{ p|capitalize }}</label>{% endfor %}
+      </fieldset>
+    </section>
+  </div>
+  <div class="modal-actions"><button class="btn btn-primary" type="submit">Save settings</button></div>
+</form>
+{% endblock %}

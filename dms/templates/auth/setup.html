@@ -1,0 +1,17 @@
+{% extends "auth/_layout.html" %}
+{% block title %}Set up{% endblock %}
+{% block content %}
+<h1>Create the administrator account</h1>
+<p class="muted">No users exist yet. This account will have full administrative access. Other people can then create their own account from the sign-in page, be added in the Admin Console, or sign in through your organisation's directory or single sign-on.</p>
+{% if error %}<div class="notice notice-error"><div>{{ error }}</div></div>{% endif %}
+<form method="post" action="{{ url_for('auth.setup') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="field"><label for="username">User name</label><input type="text" id="username" name="username" value="{{ form.get('username', '') }}" required autofocus></div>
+  <div class="field"><label for="display_name">Full name</label><input type="text" id="display_name" name="display_name" value="{{ form.get('display_name', '') }}"></div>
+  <div class="field"><label for="email">Email</label><input type="text" id="email" name="email" value="{{ form.get('email', '') }}"></div>
+  <div class="field"><label for="password">Password</label><input type="password" id="password" name="password" autocomplete="new-password" required>
+    <small class="muted">At least 12 characters, with three of: lower-case, upper-case, digits, symbols.</small></div>
+  <div class="field"><label for="password2">Repeat password</label><input type="password" id="password2" name="password2" autocomplete="new-password" required></div>
+  <button type="submit" class="btn btn-primary btn-block">Create administrator</button>
+</form>
+{% endblock %}

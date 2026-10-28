@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty, pagination with context %}
+{% block title %}All Documents{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>All Documents</h1>
+    <p class="muted">{{ total }} document{{ '' if total == 1 else 's' }}{% if filters.q or filters.type or filters.folder or filters['from'] or filters.to %} matching your filters{% endif %}</p>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" data-modal-open="upload-modal">{{ icon('upload') }} Upload Document</button>
+    <a class="btn btn-ghost" href="{{ url_for('folders.download_root') }}" title="Download every document in the library, with its folder structure">{{ icon('download') }} Download library (ZIP)</a>
+  </div>
+</div>
+
+<form class="filters card" method="get" action="{{ url_for('documents.index') }}">
+  <div class="field grow">
+    <label for="f-q">Search</label>
+    <input type="search" id="f-q" name="q" value="{{ filters.q }}" placeholder="Document name">
+  </div>
+  <div class="field">
+    <label for="f-type">Type</label>
+    <select id="f-type" name="type">
+      <option value="">All types</option>
+      {% for t in type_options %}<option value="{{ t }}" {{ 'selected' if filters.type == t }}>{{ t }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-folder">Folder</label>
+    <select id="f-folder" name="folder">
+      <option value="">All folders</option>
+      <option value="root" {{ 'selected' if filters.folder == 'root' }}>Root</option>
+      {% for f, depth in folders %}<option value="{{ f.id }}" {{ 'selected' if filters.folder == f.id|string }}>{{ '  ' * depth }}{{ f.name }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-from">Uploaded from</label>
+    <input type="date" id="f-from" name="from" value="{{ filters['from'] }}">
+  </div>
+  <div class="field">
+    <label for="f-to">to</label>
+    <input type="date" id="f-to" name="to" value="{{ filters.to }}">
+  </div>
+  <input type="hidden" name="sort" value="{{ sort }}"><input type="hidden" name="dir" value="{{ direction }}">
+  <div class="field field-actions">
+    <button class="btn btn-secondary" type="submit">Apply</button>
+    <a class="btn btn-ghost" href="{{ url_for('documents.index') }}">Reset</a>
+  </div>
+</form>
+
+{% if documents %}
+  <div class="card card-flush">
+    {% with sortable=True, endpoint='documents.index' %}{% with highlight_id=request.args.get('highlight', 0)|int %}{% include "documents/_table.html" %}{% endwith %}{% endwith %}
+  </div>
+  {{ pagination(page, pages, 'documents.index') }}
+{% else %}
+  <div class="card">
+  {% if filters.q or filters.type or filters.folder or filters['from'] or filters.to %}
+    {% call empty('No matching documents', 'Try a different search term or clear the filters.', 'search') %}
+      <a class="btn btn-ghost btn-sm" href="{{ url_for('documents.index') }}">Clear filters</a>
+    {% endcall %}
+  {% else %}
+    {% call empty('No documents yet', 'Upload PDFs, Office files, images and more.', 'file') %}
+      <button class="btn btn-primary btn-sm" data-modal-open="upload-modal">Upload document</button>
+    {% endcall %}
+  {% endif %}
+  </div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% block title %}Roles{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>Roles</h1><p class="muted">Predefined roles plus your own custom roles. A role's repository permissions apply everywhere unless a folder stops inheriting them.</p></div>
+  <div class="actions"><a class="btn btn-primary" href="{{ url_for('admin.role_edit') }}">New custom role</a></div>
+</div>
+{% include "admin/_nav.html" %}
+<div class="card card-flush"><div class="table-wrap"><table class="table">
+  <thead><tr><th>Role</th>{% for p in perms %}<th class="hide-sm">{{ perm_labels[p] }}</th>{% endfor %}<th>Capabilities</th><th class="num">Users</th></tr></thead>
+  <tbody>
+  {% for r, rp, n in rows %}
+  <tr>
+    <td><a href="{{ url_for('admin.role_edit', role_id=r.id) }}">{{ r.name }}</a>{% if r.is_system %} <span class="badge">predefined</span>{% endif %}<br><small class="muted">{{ r.description }}</small></td>
+    {% for p in perms %}<td class="hide-sm">{{ '✓' if p in rp else '' }}</td>{% endfor %}
+    <td class="small">{{ r.capability_set|sort|join(', ') or '—' }}</td>
+    <td class="num">{{ n }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table></div></div>
+{% endblock %}

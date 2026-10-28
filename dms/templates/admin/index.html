@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, post_button with context %}
+{% block title %}Admin Console{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>Admin Console</h1><p class="muted">Users, access control, policies and system status.</p></div></div>
+{% include "admin/_nav.html" %}
+
+<div class="grid-2">
+  <section class="card">
+    <h2>Security status</h2>
+    <dl class="meta">
+      <dt>Encryption at rest</dt>
+      <dd>{% if encryption %}<span class="badge badge-ok">AES-256-GCM</span> active key <code>{{ key_id }}</code>{% else %}<span class="badge badge-warn">Off</span> set DMS_ENCRYPTION_AT_REST=true{% endif %}</dd>
+      <dt>Encryption in transit</dt>
+      <dd>{% if https %}<span class="badge badge-ok">HTTPS enforced</span> (TLS 1.2+, HSTS){% else %}<span class="badge badge-warn">Not enforced</span> set DMS_FORCE_HTTPS=true and serve over TLS{% endif %}
+        {% if not secure_cookie %}<br><small class="muted">Secure session cookies are off (SESSION_COOKIE_SECURE).</small>{% endif %}</dd>
+      <dt>Malware scanning</dt>
+      <dd><span class="badge {{ 'badge-ok' if scanner in ('clamav', 'defender') else 'badge-warn' }}">{{ {'clamav': 'ClamAV', 'defender': 'Microsoft Defender', 'builtin': 'Built-in signatures only'}.get(scanner, scanner) }}</span>
+        {% if scanner == 'builtin' %}<br><small class="muted">Configure CLAMAV_HOST (or install Microsoft Defender) for full antivirus scanning.</small>{% endif %}</dd>
+      <dt>Directory / SSO</dt>
+      <dd>{% if ldap %}LDAP/AD · {% endif %}{% for p in oidc %}{{ p.label }} (OIDC) · {% endfor %}{% if saml %}SAML 2.0 · {% endif %}Local accounts</dd>
+      <dt>Office previews</dt>
+      <dd>{% if libreoffice %}<span class="badge badge-ok">LibreOffice</span> exact page rendering{% else %}Built-in HTML rendering (install LibreOffice for exact layout){% endif %}</dd>
+    </dl>
+  </section>
+  <section class="card">
+    <h2>At a glance</h2>
+    <dl class="meta">
+      <dt>Users</dt><dd><a href="{{ url_for('admin.users') }}">{{ users }}</a></dd>
+      <dt>Devices awaiting approval</dt><dd><a href="{{ url_for('admin.devices') }}">{{ pending_devices }}</a></dd>
+    </dl>
+    <div class="actions">
+      {{ post_button(url_for('admin.maintenance'), 'Run maintenance now', 'btn btn-secondary btn-sm', icon_name='refresh', title='Purge expired recycle-bin items and apply version retention') }}
+      {{ post_button(url_for('admin.reindex'), 'Rebuild search index', 'btn btn-ghost btn-sm', icon_name='search') }}
+    </div>
+  </section>
+</div>
+{% endblock %}

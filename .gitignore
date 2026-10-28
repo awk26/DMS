@@ -1,0 +1,23 @@
+# Secrets / OAuth
+credentials.json
+token.json
+token.json.tmp
+client_secret*.json
+.env
+
+# Data: database, stored documents and archived email
+instance/
+storage/
+emails/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.eml
+/instance/news/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/

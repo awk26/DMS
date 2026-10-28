@@ -1,0 +1,87 @@
+{
+  "source_url": "https://www.lloydslist.com/",
+  "method": "html",
+  "count": 8,
+  "scraped_at": "2026-10-22T06:04:01+00:00",
+  "articles": [
+    {
+      "title": "US targets law firm that helped build Iranian LPG magnate’s shipping network",
+      "url": "https://www.lloydslist.com/LL1158774/US-targets-law-firm-that-helped-build-Iranian-LPG-magnate’s-shipping-network",
+      "summary": "Karnakis & Karnakis featured prominently in a 2023 Lloyd’s List investigation that exposed the opaque corporate structures behind a fleet of gas carriers shipping Iranian LPG",
+      "published": "3 hours ago",
+      "image": "https://www.lloydslist.com/-/media/lloyds-list/images/tankers-and-gas/2025-new-pictures/tinos-i-790x444-sharpened-use-this.png?rev=b70b90abf63d4fefa9084b979e6a55f9",
+      "source": "www.lloydslist.com",
+      "paywalled": null,
+      "image_file": "images\\us-targets-law-firm-that-helped-build-iranian-lpg-magnate-s.png"
+    },
+    {
+      "title": "HSFO shortage to persist despite rising MEG crude exports",
+      "url": "https://www.lloydslist.com/LL1158762/HSFO-shortage-to-persist-despite-rising-MEG-crude-exports",
+      "summary": "Shipping will have to contend with tighter bunker availabilities globally as supply chain disruptions persist with the Hormuz conflict still in flux",
+      "published": "14 hours ago",
+      "image": "https://www.lloydslist.com/-/media/lloyds-list/images/strait-of-hormuz-crisis/ships/cargo-ships-waiting-to-pass-the-strait-of-hormuz.png?rev=fb032887fa4046ad9369c930f74b7c0c",
+      "source": "www.lloydslist.com",
+      "paywalled": null,
+      "image_file": "images\\hsfo-shortage-to-persist-despite-rising-meg-crude-exports.png"
+    },
+    {
+      "title": "China turns to new Middle East Gulf crude flows as Iranian supplies squeezed",
+      "url": "https://www.lloydslist.com/LL1158752/China-turns-to-new-Middle-East-Gulf-crude-flows-as-Iranian-supplies-squeezed",
+      "summary": "",
+      "published": "20 Oct 2026",
+      "image": "https://www.lloydslist.com/-/media/lloyds-list/images/strait-of-hormuz-crisis/maps/middle-east-gulf-map-peacock.png?rev=b710c75be55b4948806138f9e1895223",
+      "source": "www.lloydslist.com",
+      "paywalled": null,
+      "image_file": "images\\china-turns-to-new-middle-east-gulf-crude-flows-as-iranian-s.png"
+    },
+    {
+      "title": "Chinese lessors risk forfeiting legal protections by tolerating Hormuz transits",
+      "url": "https://www.lloydslist.com/LL1158697/Chinese-lessors-risk-forfeiting-legal-protections-by-tolerating-Hormuz-transits",
+      "summary": "A seasoned shipping lawyer warns that Chinese lessors’ tolerance of Hormuz transits could leave them exposed to sanctions risk and stripped of contractual protections",
+      "published": "14 Oct 2026",
+      "image": "https://www.lloydslist.com/-/media/lloyds-list/images/people/2026-new-pictures/andrew-rigden-green.png?rev=4b8d1f89095e4bd8acfc52b99965561b",
+      "source": "www.lloydslist.com",
+      "paywalled": null,
+      "image_file": "images\\chinese-lessors-risk-forfeiting-legal-protections-by-tolerat.png"
+    },
+    {
+      "title": "Containership owners warn of overcapacity as orderbook hits post-2009 high",
+      "url": "https://www.lloydslist.com/LL1158755/Containership-owners-warn-of-overcapacity-as-orderbook-hits-post-2009-high",
+      "summary": "Orderbook has climbed to its highest level since 2009 after a fresh round of orders, prompting senior industry figures to warn the sector risks repeating the overcapacity cycle that followed the last ordering boom",
+      "published": "20 Oct 2026",
+      "image": "https://www.lloydslist.com/-/media/lloyds-list/images/containers/2025-new-pictures/hmm-logo-generic.png?rev=43ffab7aa6d14122b15313e5171ace68",
+      "source": "www.lloydslist.com",
+      "paywalled": null,
+      "image_file": "images\\containership-owners-warn-of-overcapacity-as-orderbook-hits.png"
+    },
+    {
+      "title": "Have your say! The Lloyd’s List Shipping Outlook Survey: 2026 and beyond",
+      "url": "https://www.lloydslist.com/LL1158757/Have-your-say-The-Lloyds-List-Shipping-Outlook-Survey-2026-and-beyond",
+      "summary": "",
+      "published": "16 hours ago",
+      "image": "https://www.lloydslist.com/-/media/lloyds-list/images/branding-and-banners/2026-new-pictures/poll2026-words.png?rev=3714722150ae423989b6573b7193b118",
+      "source": "www.lloydslist.com",
+      "paywalled": null,
+      "image_file": "images\\have-your-say-the-lloyd-s-list-shipping-outlook-survey-2026.png"
+    },
+    {
+      "title": "North Korean ghost voyages expose gaps in sanctions monitoring",
+      "url": "https://www.lloydslist.com/LL1158727/North-Korean-ghost-voyages-expose-gaps-in-sanctions-monitoring",
+      "summary": "A North Korean bulker repeatedly created convincing false voyages to Malaysia while apparently carrying sanctioned coal to China, with one phantom call entering Malaysia’s official maritime reporting system, prompting authorities to search for a ship that was actually back in North Korea",
+      "published": "16 Oct 2026",
+      "image": "https://www.lloydslist.com/-/media/lloyds-list/images/dry-bulk/2026-new-pictures/tae-phyong.png?rev=9400a300cd9b46e2bd1525c55a8bf232",
+      "source": "www.lloydslist.com",
+      "paywalled": null,
+      "image_file": "images\\north-korean-ghost-voyages-expose-gaps-in-sanctions-monitori.png"
+    },
+    {
+      "title": "How worried should you be about the orderbook?",
+      "url": "https://www.lloydslist.com/articles/2026/10/05/how-worried-should-you-be-about-the-orderbook",
+      "summary": "Container shipping’s orderbook looks significant, tanker contracting is rising again and dry bulk is becoming more top-heavy — but Lloyd’s List markets editor Rob Willmington says the headline numbers form only part of the narrative",
+      "published": "",
+      "image": "",
+      "source": "www.lloydslist.com",
+      "paywalled": null
+    }
+  ]
+}

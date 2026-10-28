@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% block title %}{{ user.label if user else 'New user' }}{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>{{ user.label if user else 'New user' }}</h1></div></div>
+{% include "admin/_nav.html" %}
+<div class="grid-2">
+<section class="card">
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="field"><label for="u-name">User name</label>
+      <input type="text" id="u-name" name="username" value="{{ user.username if user else '' }}" {{ 'disabled' if user else 'required' }}></div>
+    <div class="field"><label for="u-display">Full name</label><input type="text" id="u-display" name="display_name" value="{{ user.display_name if user else '' }}"></div>
+    <div class="field"><label for="u-email">Email</label><input type="text" id="u-email" name="email" value="{{ (user.email or '') if user else '' }}"></div>
+    <div class="field"><label for="u-source">Sign-in method</label>
+      <select id="u-source" name="auth_source">
+        {% for value, label in [('local', 'Local account (password)'), ('ldap', 'Active Directory / LDAP'), ('oidc', 'Single sign-on (OpenID Connect)'), ('saml', 'Single sign-on (SAML)')] %}
+        <option value="{{ value }}" {{ 'selected' if user and user.auth_source == value }}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <small class="muted">Pre-create SSO/LDAP users with their email to control their roles before they first sign in.</small></div>
+    <div class="field"><label for="u-pass">{{ 'New password (leave empty to keep)' if user else 'Password' }}</label>
+      <input type="password" id="u-pass" name="password" autocomplete="new-password">
+      <small class="muted">Local accounts only. At least 12 characters, with three of: lower-case, upper-case, digits, symbols.</small></div>
+    <fieldset class="field"><label>Roles</label>
+      {% for r in roles %}
+      <label class="check"><input type="checkbox" name="roles" value="{{ r.id }}" {{ 'checked' if user and r in user.roles }}> {{ r.name }} <small class="muted">{{ r.description }}</small></label>
+      {% endfor %}
+    </fieldset>
+    {% if user %}<label class="check"><input type="checkbox" name="is_active" value="1" {{ 'checked' if user.is_active }}> Account active</label>{% endif %}
+    <div class="modal-actions">
+      <a class="btn btn-ghost" href="{{ url_for('admin.users') }}">Cancel</a>
+      <button class="btn btn-primary" type="submit">Save</button>
+    </div>
+  </form>
+</section>
+{% if user %}
+<section class="card">
+  <h2>Security</h2>
+  <dl class="meta">
+    <dt>MFA</dt><dd>{{ 'Enabled' if user.mfa_enabled else 'Not enrolled' }}</dd>
+    <dt>Locked until</dt><dd>{{ user.locked_until|dt }}</dd>
+    <dt>Last sign-in</dt><dd>{{ user.last_login_at|dt }}</dd>
+  </dl>
+  <div class="actions">
+    <form method="post" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="reset_mfa"><button class="btn btn-ghost btn-sm" {{ 'disabled' if not user.mfa_enabled }}>Reset MFA</button></form>
+    <form method="post" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="unlock"><button class="btn btn-ghost btn-sm">Unlock account</button></form>
+  </div>
+  <h2>Devices</h2>
+  <ul class="list compact">
+    {% for d in devices %}
+    <li class="list-row"><span class="list-main"><span>{{ d.platform|capitalize }} <span class="badge {{ 'badge-ok' if d.status == 'approved' else 'badge-warn' }}">{{ d.status }}</span></span><small class="muted truncate">{{ d.user_agent }} · {{ d.last_seen|dt }} · {{ d.last_ip }}</small></span></li>
+    {% else %}<li class="muted">No devices.</li>{% endfor %}
+  </ul>
+  <a class="link-sm" href="{{ url_for('admin.devices') }}">Manage devices</a>
+</section>
+{% endif %}
+</div>
+{% endblock %}

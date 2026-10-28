@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty, fav_button with context %}
+{% block title %}Shared with me{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>Shared with me</h1><p class="muted">Folders and files other people have shared with you.</p></div></div>
+{% if folders %}
+<section class="folder-cards">
+  {% for f in folders %}
+  <div class="folder-card"><a class="folder-card-link" href="{{ url_for('folders.browse', folder_id=f.id) }}">
+    <span class="stat-icon si-amber">{{ icon('folder') }}</span>
+    <span class="list-main"><span class="truncate">{{ f.name }}</span><small class="muted">{% if shared_by.get(('folder', f.id)) %}Shared by {{ shared_by[('folder', f.id)] }}{% else %}Shared folder{% endif %}</small></span></a>
+    {{ fav_button('folder', f.id) }}
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+{% if documents %}
+<div class="card card-flush">{% with sortable=False %}{% with highlight_id=0 %}{% include "documents/_table.html" %}{% endwith %}{% endwith %}</div>
+{% endif %}
+{% if not folders and not documents %}
+<div class="card">{% call empty('Nothing shared with you yet', 'When someone shares a folder or file with you, it appears here.', 'share') %}{% endcall %}</div>
+{% endif %}
+{% endblock %}

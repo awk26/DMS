@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty, post_button, fav_button with context %}
+{% block title %}{{ folder_label(folder) if folder else 'Shared library' }}{% endblock %}
+{% block content %}
+<nav class="breadcrumbs" aria-label="Breadcrumb">
+  {% set trail = crumbs(folder) %}
+  {% if not trail or trail[0][0].id != home_folder_id %}<a href="{{ url_for('folders.root') }}">Shared library</a><span>/</span>{% endif %}
+  {% for f, label, visible in trail %}{% if loop.last %}<span class="current">{{ label }}</span>{% else %}{% if visible %}<a href="{{ url_for('folders.browse', folder_id=f.id) }}">{{ label }}</a>{% else %}<span class="muted">{{ label }}</span>{% endif %}<span>/</span>{% endif %}{% endfor %}
+</nav>
+
+<div class="page-head">
+  <div>
+    <h1 class="break">{{ folder_label(folder) if folder else 'Shared library' }}
+      {% if folder %}{{ fav_button('folder', folder.id) }}{% endif %}
+    </h1>
+    <p class="muted">{{ subfolders|length }} folder{{ '' if subfolders|length == 1 else 's' }} · {{ documents|length }} document{{ '' if documents|length == 1 else 's' }}{% if links %} · {{ links|length }} shortcut{{ '' if links|length == 1 else 's' }}{% endif %}{% if folder and not folder.inherit_permissions %} · <span title="This folder does not inherit permissions">{{ icon('lock') }} own permissions</span>{% endif %}</p>
+  </div>
+  <div class="actions">
+    {% if 'edit' in perms %}
+    <button class="btn btn-primary" data-modal-open="upload-modal">{{ icon('upload') }} Upload Document</button>
+    <button class="btn btn-secondary" data-modal-open="folder-modal">{{ icon('folder-plus') }} New folder</button>
+    {% endif %}
+    {% if folder and ('share' in perms) %}<a class="btn btn-secondary" href="{{ url_for('access.manage', kind='folder', obj_id=folder.id) }}">{{ icon('share') }} Share</a>{% endif %}
+    {% set zip_url = url_for('folders.download', folder_id=folder.id) if folder else url_for('folders.download_root') %}
+    {% if 'download' in perms %}<a class="btn btn-ghost" href="{{ zip_url }}" title="Current version of every document you can download, including subfolders">{{ icon('download') }} {{ 'Download Folder (ZIP)' if folder else 'Download library (ZIP)' }}</a>{% endif %}
+    <details class="menu">
+      <summary class="btn btn-ghost" aria-label="More actions">{{ icon('more') }} More</summary>
+      <div class="menu-list">
+        {% if 'download' in perms %}<a href="{{ zip_url }}?versions=1">{{ icon('layers') }} Download ZIP with version history</a>{% endif %}
+        {% if folder %}
+          {% if 'edit' in perms and not is_system %}
+          <button type="button" data-rename data-action="{{ url_for('folders.rename', folder_id=folder.id) }}" data-name="{{ folder.name }}" data-kind="folder">{{ icon('edit') }} Rename folder</button>
+          {% if 'delete' in perms %}<button type="button" data-move data-kind="folder" data-action="{{ url_for('folders.move', folder_id=folder.id) }}" data-current="{{ folder.parent_id or '' }}" data-self="{{ folder.id }}" data-name="{{ folder.name }}">{{ icon('move') }} Move folder</button>{% endif %}
+          {% endif %}
+          {% if 'download' in perms %}<button type="button" data-move data-kind="folder" data-mode="copy" data-action="{{ url_for('folders.copy', folder_id=folder.id) }}" data-current="{{ folder.parent_id or '' }}" data-self="{{ folder.id }}" data-name="{{ folder.name }}">{{ icon('copy') }} Copy folder to…</button>{% endif %}
+          {% if 'manage' in perms %}<a href="{{ url_for('access.manage', kind='folder', obj_id=folder.id) }}#advanced">{{ icon('key') }} Advanced permissions</a>{% endif %}
+          {% if has_cap('records') %}<button type="button" data-modal-open="retention-modal">{{ icon('history') }} Version retention</button>{% endif %}
+          <a href="{{ url_for('folders.history', folder_id=folder.id) }}">{{ icon('history') }} Folder history</a>
+          {% if 'delete' in perms and not is_system %}{{ post_button(url_for('folders.delete', folder_id=folder.id), 'Delete folder', 'menu-danger', confirm='Move the folder “' ~ folder.name ~ '” and everything in it to the recycle bin? It can be restored for a limited time.', icon_name='trash') }}{% endif %}
+        {% elif has_cap('admin') %}
+          <a href="{{ url_for('access.manage', kind='repository', obj_id=0) }}">{{ icon('key') }} Repository permissions</a>
+        {% endif %}
+      </div>
+    </details>
+  </div>
+</div>
+
+<div class="browse-grid">
+  <aside class="card tree-card">
+    <h2 class="small-head">Folders</h2>
+    <ul class="tree">
+      <li><a href="{{ url_for('folders.root') }}" class="{{ 'active' if not folder }}">{{ icon('home') }} Shared library</a></li>
+      {% for f, depth in tree %}
+      <li style="padding-left: {{ depth * 14 }}px"><a href="{{ url_for('folders.browse', folder_id=f.id) }}" class="{{ 'active' if folder and folder.id == f.id }}">{{ icon('folder') }}<span class="truncate">{{ folder_label(f) }}</span><small class="muted">{{ counts.get(f.id, 0) }}</small></a></li>
+      {% endfor %}
+    </ul>
+  </aside>
+
+  <div>
+    {% if subfolders %}
+    <section class="folder-cards">
+      {% for f in subfolders %}
+      <div class="folder-card">
+        <a class="folder-card-link" href="{{ url_for('folders.browse', folder_id=f.id) }}">
+          <span class="stat-icon si-amber">{{ icon('folder') }}</span>
+          <span class="list-main"><span class="truncate">{{ folder_label(f) }}</span><small class="muted">{{ counts.get(f.id, 0) }} docs · {{ sub_counts.get(f.id, 0) }} folders</small></span>
+        </a>
+        {{ fav_button('folder', f.id) }}
+        {% if can('download', f) %}<a class="icon-btn" href="{{ url_for('folders.download', folder_id=f.id) }}" title="Download “{{ f.name }}” as ZIP" aria-label="Download {{ f.name }} as ZIP">{{ icon('download') }}</a>{% endif %}
+      </div>
+      {% endfor %}
+    </section>
+    {% endif %}
+
+    {% if documents or links %}
+      <div class="card card-flush">
+        {% with sortable=False, hide_folder=True %}{% with highlight_id=request.args.get('highlight', 0)|int %}{% include "documents/_table.html" %}{% endwith %}{% endwith %}
+      </div>
+    {% elif not subfolders %}
+      <div class="card">
+        {% call empty('This folder is empty', 'Upload documents or create a subfolder.' if 'edit' in perms else 'There is nothing here you can see.', 'folder') %}
+          {% if 'edit' in perms %}
+          <div class="actions center">
+            <button class="btn btn-primary btn-sm" data-modal-open="upload-modal">Upload document</button>
+            <button class="btn btn-ghost btn-sm" data-modal-open="folder-modal">New folder</button>
+          </div>
+          {% endif %}
+        {% endcall %}
+      </div>
+    {% endif %}
+  </div>
+</div>
+
+{% if folder and has_cap('records') %}
+<div class="modal" id="retention-modal" hidden role="dialog" aria-modal="true" aria-labelledby="ret-title">
+  <div class="modal-card modal-sm">
+    <div class="modal-head"><h2 id="ret-title">Version retention</h2><button class="icon-btn" data-modal-close aria-label="Close">&times;</button></div>
+    <form method="post" action="{{ url_for('folders.retention', folder_id=folder.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <p class="small muted">Applies to documents in this folder and its subfolders. Leave empty to inherit from the parent folder or the system setting. The current version is never removed.</p>
+      <div class="field"><label for="ret-n">Keep the last N versions</label><input type="text" id="ret-n" name="keep_last" value="{{ folder.version_keep_last if folder.version_keep_last is not none else '' }}" inputmode="numeric"></div>
+      <div class="field"><label for="ret-y">Keep versions for X years</label><input type="text" id="ret-y" name="keep_years" value="{{ folder.version_keep_years if folder.version_keep_years is not none else '' }}" inputmode="numeric"></div>
+      <div class="modal-actions"><button type="button" class="btn btn-ghost" data-modal-close>Cancel</button><button class="btn btn-primary">Save</button></div>
+    </form>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

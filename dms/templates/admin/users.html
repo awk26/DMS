@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% block title %}Users{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>Users</h1><p class="muted">{{ users|length }} user{{ '' if users|length == 1 else 's' }}</p></div>
+  <div class="actions"><a class="btn btn-primary" href="{{ url_for('admin.user_new') }}">{{ icon('users') }} Add user</a></div>
+</div>
+{% include "admin/_nav.html" %}
+<form class="filters card" method="get">
+  <div class="field grow"><label for="uq">Find</label><input type="search" id="uq" name="q" value="{{ q }}" placeholder="Name, user name or email"></div>
+  <div class="field field-actions"><button class="btn btn-secondary">Search</button></div>
+</form>
+<div class="card card-flush"><div class="table-wrap"><table class="table">
+  <thead><tr><th>User</th><th class="hide-md">Email</th><th>Roles</th><th class="hide-sm">Sign-in</th><th class="hide-sm">MFA</th><th>Status</th><th class="hide-md">Last sign-in</th></tr></thead>
+  <tbody>
+  {% for u in users %}
+  <tr>
+    <td><a href="{{ url_for('admin.user_edit', user_id=u.id) }}">{{ u.label }}</a><br><small class="muted">{{ u.username }}</small></td>
+    <td class="hide-md muted">{{ u.email or '' }}</td>
+    <td>{{ u.roles|map(attribute='name')|join(', ') or '—' }}</td>
+    <td class="hide-sm muted">{{ u.auth_source }}</td>
+    <td class="hide-sm">{{ 'On' if u.mfa_enabled else '—' }}</td>
+    <td>{% if not u.is_active %}<span class="badge badge-warn">Disabled</span>{% elif u.locked_until %}<span class="badge badge-warn">Locked</span>{% else %}<span class="badge badge-ok">Active</span>{% endif %}</td>
+    <td class="hide-md muted nowrap">{{ u.last_login_at|dt }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table></div></div>
+{% endblock %}

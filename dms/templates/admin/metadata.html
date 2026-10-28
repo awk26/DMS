@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Metadata &amp; tags{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>Metadata &amp; tags</h1><p class="muted">Document types, custom fields, controlled vocabularies and approved tags.</p></div></div>
+{% include "admin/_nav.html" %}
+<div class="grid-2">
+  <section class="card">
+    <h2>Custom fields</h2>
+    <p class="small muted">A field applies to all documents, to one document type, to a folder (and its subfolders), or to a type within a folder. Required fields must be filled in at upload.</p>
+    <ul class="list compact">
+      {% for f in fields %}
+      <li><details><summary class="list-row"><span class="list-main"><span>{{ f.label }} <code>{{ f.name }}</code>{% if f.required %} <span class="badge badge-warn">required</span>{% endif %}</span>
+        <small class="muted">{{ field_types[f.field_type] }}{% if f.vocabulary %} · {{ f.vocabulary.name }}{% endif %} · {{ f.document_type.name if f.document_type else 'all types' }} · {{ f.folder.path if f.folder else 'all folders' }}</small></span></summary>
+        {% with field=f %}{% include "admin/_field_form.html" %}{% endwith %}</details></li>
+      {% else %}<li class="muted">No custom fields yet.</li>{% endfor %}
+    </ul>
+    <details><summary class="btn btn-secondary btn-sm">Add field</summary>{% with field=None %}{% include "admin/_field_form.html" %}{% endwith %}</details>
+  </section>
+
+  <section class="card">
+    <h2>Document types</h2>
+    <ul class="list compact">
+      {% for t in types %}
+      <li class="list-row"><span class="list-main"><span>{{ t.name }}</span><small class="muted">{{ t.description }}</small></span>
+        <form method="post" action="{{ url_for('admin.type_save') }}" class="inline-form" data-confirm="Delete the document type “{{ t.name }}”? Its type-specific fields are deleted too.">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="id" value="{{ t.id }}"><input type="hidden" name="action" value="delete">
+          <button class="btn btn-ghost btn-xs btn-danger-text">Delete</button></form></li>
+      {% else %}<li class="muted">No document types yet.</li>{% endfor %}
+    </ul>
+    <form method="post" action="{{ url_for('admin.type_save') }}" class="filters">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="field grow"><label for="t-name">Name</label><input type="text" id="t-name" name="name" required placeholder="Contract"></div>
+      <div class="field grow"><label for="t-desc">Description</label><input type="text" id="t-desc" name="description"></div>
+      <div class="field field-actions"><button class="btn btn-secondary">Add type</button></div>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Controlled vocabularies</h2>
+    {% for v in vocabularies %}
+    <details><summary class="list-row"><span class="list-main"><span>{{ v.name }}</span><small class="muted">{{ v.terms|length }} value(s)</small></span></summary>
+      {% with vocab=v %}{% include "admin/_vocab_form.html" %}{% endwith %}</details>
+    {% else %}<p class="muted">No vocabularies yet.</p>{% endfor %}
+    <details><summary class="btn btn-secondary btn-sm">Add vocabulary</summary>{% with vocab=None %}{% include "admin/_vocab_form.html" %}{% endwith %}</details>
+  </section>
+
+  <section class="card">
+    <h2>Approved tags</h2>
+    <p class="small muted">{% if tags_controlled %}Tags are <strong>controlled</strong>: users can only choose from this list.{% else %}Users can create new tags freely. Turn on controlled tags in Settings to restrict them to this list.{% endif %}</p>
+    <p>{% for t in tags %}<span class="badge">{{ t.name }}
+      <form method="post" action="{{ url_for('admin.tags_save') }}" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{{ t.id }}"><button class="toast-close" aria-label="Delete tag {{ t.name }}">&times;</button></form></span> {% else %}<span class="muted">No tags yet.</span>{% endfor %}</p>
+    <form method="post" action="{{ url_for('admin.tags_save') }}" class="filters">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="field grow"><label for="tg">Add tags</label><input type="text" id="tg" name="names" placeholder="Comma-separated" required></div>
+      <div class="field field-actions"><button class="btn btn-secondary">Add</button></div>
+    </form>
+  </section>
+</div>
+{% endblock %}

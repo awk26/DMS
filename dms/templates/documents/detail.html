@@ -1,0 +1,243 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, filetype, post_button with context %}
+{% block title %}{{ doc.name }}{% endblock %}
+{% block content %}
+{% set cv = doc.current_version %}
+{% set mine = doc.checked_out_by_id == current_user.id %}
+{% set locked = doc.checked_out_by_id and not mine %}
+<nav class="breadcrumbs" aria-label="Breadcrumb">
+  {% set trail = crumbs(doc.folder) %}
+  {% if not trail or trail[0][0].id != home_folder_id %}<a href="{{ url_for('folders.root') }}">Shared library</a>{% endif %}
+  {% for f, label, visible in trail %}{% if not loop.first or trail[0][0].id != home_folder_id %}<span>/</span>{% endif %}{% if visible %}<a href="{{ url_for('folders.browse', folder_id=f.id) }}">{{ label }}</a>{% else %}<span class="muted">{{ label }}</span>{% endif %}{% endfor %}
+</nav>
+
+<div class="page-head">
+  <div class="title-row">
+    {{ filetype(doc.extension) }}
+    <div>
+      <h1 class="break">{{ doc.name }}
+        {% if not doc.is_deleted %}{{ post_button(url_for('folders.toggle_favourite'), '', 'icon-btn star-btn' ~ (' is-starred' if starred else ''), icon_name='star-fill' if starred else 'star', next=request.full_path, title='Remove from favourites' if starred else 'Add to favourites', extra={'kind': 'document', 'id': doc.id}) }}{% endif %}
+      </h1>
+      <p class="muted">{{ doc.extension|typelabel }} · {{ cv.size|filesize if cv }} · Version {{ cv.label if cv }} · Updated {{ doc.updated_at|dt }}</p>
+      {% if doc.checked_out_by_id %}<p><span class="badge badge-warn">{{ icon('lock') }} Checked out by {{ 'you' if mine else doc.checked_out_by.label }} since {{ doc.checked_out_at|dt }}</span></p>{% endif %}
+    </div>
+  </div>
+  <div class="actions">
+    {% if doc.is_deleted %}
+      <span class="badge badge-warn">In the recycle bin{% if expires %} · deleted permanently on {{ expires|dt('%d %b %Y') }}{% endif %}</span>
+      {{ post_button(url_for('documents.restore', doc_id=doc.id), 'Restore', 'btn btn-primary', icon_name='restore', next=url_for('documents.detail', doc_id=doc.id)) }}
+    {% else %}
+      {% if 'download' in perms %}<a class="btn btn-primary" href="{{ url_for('documents.download', doc_id=doc.id) }}">{{ icon('download') }} Download</a>{% endif %}
+      {% if 'share' in perms %}<a class="btn btn-secondary" href="{{ url_for('access.manage', kind='document', obj_id=doc.id) }}">{{ icon('share') }} Share</a>{% endif %}
+      {% if 'edit' in perms %}
+        {% if mine %}
+          <button class="btn btn-secondary" data-modal-open="checkin-modal">{{ icon('unlock') }} Check in</button>
+          {{ post_button(url_for('documents.release', doc_id=doc.id), 'Discard check-out', 'btn btn-ghost', confirm='Release the check-out without uploading a new version?') }}
+        {% elif not locked %}
+          <button class="btn btn-secondary" data-modal-open="version-modal">{{ icon('upload') }} Upload New Version</button>
+          {{ post_button(url_for('documents.checkout', doc_id=doc.id), 'Check out', 'btn btn-ghost', icon_name='lock', title='Lock the document so only you can change it') }}
+        {% endif %}
+      {% endif %}
+      {% if locked and (has_cap('records') or 'manage' in perms) %}
+        {{ post_button(url_for('documents.release', doc_id=doc.id), 'Override check-out', 'btn btn-ghost btn-danger-text', confirm='Release the check-out held by ' ~ doc.checked_out_by.label ~ '? Their unsaved changes will not be uploaded.') }}
+      {% endif %}
+      <details class="menu">
+        <summary class="btn btn-ghost" aria-label="More actions">{{ icon('more') }} More</summary>
+        <div class="menu-list">
+          {% if compare_ok and versions|length > 1 %}<a href="{{ url_for('documents.compare', doc_id=doc.id) }}">{{ icon('compare') }} Compare versions</a>{% endif %}
+          {% if 'edit' in perms and not locked %}
+          <button type="button" data-rename data-action="{{ url_for('documents.rename', doc_id=doc.id) }}" data-name="{{ doc.name }}">{{ icon('edit') }} Rename</button>
+          {% if 'delete' in perms %}<button type="button" data-move data-action="{{ url_for('documents.move', doc_id=doc.id) }}" data-current="{{ doc.folder_id or '' }}" data-name="{{ doc.name }}">{{ icon('move') }} Move</button>{% endif %}
+          {% endif %}
+          {% if 'download' in perms %}<button type="button" data-move data-mode="copy" data-action="{{ url_for('documents.copy', doc_id=doc.id) }}" data-current="{{ doc.folder_id or '' }}" data-name="{{ doc.name }}">{{ icon('copy') }} Copy to…</button>{% endif %}
+          <button type="button" data-move data-mode="link" data-action="{{ url_for('documents.add_link', doc_id=doc.id) }}" data-current="{{ doc.folder_id or '' }}" data-name="{{ doc.name }}">{{ icon('shortcut') }} Add shortcut in another folder</button>
+          {% if 'manage' in perms %}<a href="{{ url_for('access.manage', kind='document', obj_id=doc.id) }}#advanced">{{ icon('key') }} Advanced permissions</a>{% endif %}
+          {% if 'delete' in perms and not locked %}
+          {{ post_button(url_for('documents.delete', doc_id=doc.id), 'Delete', 'menu-danger', confirm='Move “' ~ doc.name ~ '” to the recycle bin? You can restore it later.', icon_name='trash', next=url_for('documents.index')) }}
+          {% endif %}
+        </div>
+      </details>
+    {% endif %}
+  </div>
+</div>
+
+<div class="detail-grid">
+  <section class="card card-flush preview-card">
+    <div class="card-head pad"><h2>Preview</h2></div>
+    {% if preview_kind == 'pdf' %}
+      <iframe class="preview-frame" src="{{ url_for('documents.preview', doc_id=doc.id) }}" title="PDF preview"></iframe>
+    {% elif preview_kind == 'image' %}
+      <div class="preview-image"><img src="{{ url_for('documents.preview', doc_id=doc.id) }}" alt="{{ doc.name }}"></div>
+    {% elif preview_kind == 'video' %}
+      <div class="preview-image"><video controls preload="metadata" src="{{ url_for('documents.preview', doc_id=doc.id) }}">Your browser cannot play this video. Download it instead.</video></div>
+    {% elif preview_kind == 'audio' %}
+      <div class="preview-none"><audio controls preload="metadata" src="{{ url_for('documents.preview', doc_id=doc.id) }}">Your browser cannot play this audio file.</audio></div>
+    {% elif preview_kind == 'text' %}
+      <pre class="preview-text">{{ text_preview }}</pre>
+      {% if truncated %}<p class="muted pad">Preview truncated. Download the file to see the full content.</p>{% endif %}
+    {% elif preview_kind == 'office' and office_mode == 'pdf' %}
+      <iframe class="preview-frame" src="{{ url_for('documents.preview', doc_id=doc.id) }}" title="Document preview"></iframe>
+    {% elif preview_kind == 'office' and office_mode == 'html' %}
+      <iframe class="preview-frame" sandbox src="{{ url_for('documents.render', doc_id=doc.id) }}" title="Document preview"></iframe>
+    {% else %}
+      <div class="preview-none">
+        {{ filetype(doc.extension) }}
+        <h3>Preview not available</h3>
+        <p class="muted">{{ doc.extension|typelabel }} files can't be previewed in the browser.{% if 'download' in perms %} Download the original file to open it.{% endif %}</p>
+        {% if 'download' in perms %}<a class="btn btn-primary" href="{{ url_for('documents.download', doc_id=doc.id) }}">{{ icon('download') }} Download original</a>{% endif %}
+      </div>
+    {% endif %}
+  </section>
+
+  <aside class="side-col">
+    <section class="card">
+      <h2>Details</h2>
+      <dl class="meta">
+        <dt>Location</dt><dd>{% if doc.folder %}<a href="{{ url_for('folders.browse', folder_id=doc.folder.id) }}">{{ doc.folder.path }}</a>{% else %}Root{% endif %}</dd>
+        <dt>Author</dt><dd>{{ doc.created_by.label if doc.created_by else '—' }}</dd>
+        <dt>Type</dt><dd>{{ doc.extension|typelabel }} (.{{ doc.extension }})</dd>
+        <dt>Size</dt><dd>{{ cv.size|filesize if cv }}</dd>
+        <dt>Created</dt><dd>{{ doc.created_at|dt }}</dd>
+        <dt>Modified</dt><dd>{{ doc.updated_at|dt }}</dd>
+        <dt>Version</dt><dd>{{ cv.label if cv }} ({{ doc.versions|length }} stored)</dd>
+        <dt>Malware scan</dt><dd>{{ cv.scan_status|capitalize if cv }}{% if cv and cv.scan_engine %} ({{ cv.scan_engine }}){% endif %}</dd>
+        <dt>SHA-256</dt><dd class="mono small break">{{ cv.sha256 if cv }}</dd>
+      </dl>
+    </section>
+
+    <section class="card" id="properties">
+      <div class="card-head"><h2>Properties</h2></div>
+      {% if 'edit' in perms and not doc.is_deleted and not locked %}
+      <form method="post" action="{{ url_for('documents.update_metadata', doc_id=doc.id) }}" data-metadata-form data-folder-id="{{ doc.folder_id or '' }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="field"><label for="d-type">Document type</label>
+          <select id="d-type" name="document_type_id" data-doctype-select data-selected="{{ doc.document_type_id or '' }}"><option value="">(none)</option>
+            {% for t in doc_types %}<option value="{{ t.id }}" {{ 'selected' if doc.document_type_id == t.id }}>{{ t.name }}</option>{% endfor %}</select></div>
+        <div data-metadata-fields data-values="{{ values|tojson|forceescape }}">
+          {% for f in fields %}
+          <div class="field"><label for="meta-{{ f.id }}">{{ f.label }}{% if f.required %} *{% endif %}</label>
+            {% if f.field_type == 'choice' %}
+              <select id="meta-{{ f.id }}" name="meta_{{ f.id }}" {{ 'required' if f.required }}><option value=""></option>{% for t in (f.vocabulary.terms if f.vocabulary else []) %}<option {{ 'selected' if values.get(f.id) == t.value }}>{{ t.value }}</option>{% endfor %}</select>
+            {% elif f.field_type == 'boolean' %}
+              <select id="meta-{{ f.id }}" name="meta_{{ f.id }}"><option value=""></option><option value="yes" {{ 'selected' if values.get(f.id) == 'yes' }}>Yes</option><option value="no" {{ 'selected' if values.get(f.id) == 'no' }}>No</option></select>
+            {% else %}
+              <input type="{{ 'date' if f.field_type == 'date' else 'text' }}" id="meta-{{ f.id }}" name="meta_{{ f.id }}" value="{{ values.get(f.id, '') }}" {{ 'required' if f.required }} {{ 'inputmode=decimal' if f.field_type == 'number' }}>
+            {% endif %}
+            {% if f.help_text %}<small class="muted">{{ f.help_text }}</small>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+        <div class="field"><label for="d-tags">Tags</label><input type="text" id="d-tags" name="tags" value="{{ doc.tags|map(attribute='name')|join(', ') }}" list="tag-options"></div>
+        <button class="btn btn-secondary btn-sm" type="submit">Save properties</button>
+      </form>
+      {% else %}
+      <dl class="meta">
+        <dt>Document type</dt><dd>{{ doc.document_type.name if doc.document_type else '—' }}</dd>
+        {% for f in fields %}<dt>{{ f.label }}</dt><dd>{{ values.get(f.id) or '—' }}</dd>{% endfor %}
+        <dt>Tags</dt><dd>{% for t in doc.tags %}<a class="badge" href="{{ url_for('documents.index', tag=t.name) }}">{{ t.name }}</a> {% else %}—{% endfor %}</dd>
+      </dl>
+      {% endif %}
+    </section>
+
+    {% if links %}
+    <section class="card">
+      <h2>Shortcuts</h2>
+      <p class="small muted">This document also appears in:</p>
+      <ul class="list compact">
+        {% for l in links %}
+        <li class="list-row"><span class="list-main">{% if l.folder %}<a href="{{ url_for('folders.browse', folder_id=l.folder.id) }}">{{ l.folder.path }}</a>{% else %}Root{% endif %}</span>
+          {% if can('edit', l.folder) %}{{ post_button(url_for('documents.remove_link', link_id=l.id), '', 'icon-btn', icon_name='trash', title='Remove shortcut', next=request.full_path) }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    <section class="card" id="versions">
+      <div class="card-head"><h2>Version history</h2><span class="small muted">{{ doc.versions|length }} stored</span></div>
+      <p class="small muted">Every version is kept. Restoring creates a new version with the old content; nothing is erased.</p>
+      {% if compare_ok and versions|length > 1 %}
+      <form method="get" action="{{ url_for('documents.compare', doc_id=doc.id) }}" id="compare-form"></form>
+      {% endif %}
+      <ol class="versions">
+        {% for v in versions %}
+        <li class="{{ 'is-current' if cv and v.id == cv.id }}">
+          <div class="v-head">
+            {% if compare_ok and versions|length > 1 %}<input type="checkbox" name="pick" value="{{ v.version_number }}" form="compare-form" data-compare-pick aria-label="Select version {{ v.label }} to compare">{% endif %}
+            <span class="badge {{ 'badge-primary' if cv and v.id == cv.id }}">v{{ v.label }}</span>
+            <span class="small muted">{% if cv and v.id == cv.id %}Latest version{% elif v.version_number == 1 %}Original upload{% elif v.restored_from %}Restored{% else %}Previous version{% endif %}{% if v.version_number == 1 and cv and v.id == cv.id %} · original upload{% endif %}{% if v.is_major %} · major{% endif %}</span>
+            <span class="small muted push">{{ v.created_at|dt }}</span>
+          </div>
+          <div class="small muted">{{ v.size|filesize }} · {{ v.original_filename }}{% if v.created_by %} · {{ v.created_by.label }}{% endif %}</div>
+          {% if v.note %}<div class="small">{{ v.note }}</div>{% endif %}
+          <div class="v-actions">
+            {% if 'download' in perms %}<a class="btn btn-ghost btn-xs" href="{{ url_for('documents.download_version', doc_id=doc.id, number=v.version_number) }}">{{ icon('download') }} Download v{{ v.label }}</a>{% endif %}
+            {% if not doc.is_deleted and cv and v.id != cv.id and 'edit' in perms and not locked %}
+              {{ post_button(url_for('documents.restore_version', doc_id=doc.id, number=v.version_number), 'Restore this version', 'btn btn-ghost btn-xs', confirm='Restore version ' ~ v.label ~ '? Its content becomes a new current version; existing versions are kept.', icon_name='restore') }}
+            {% endif %}
+            {% if 'manage' in perms %}<a class="btn btn-ghost btn-xs" href="{{ url_for('access.manage', kind='version', obj_id=doc.id, number=v.version_number) }}">{{ icon('key') }} Access</a>{% endif %}
+          </div>
+        </li>
+        {% endfor %}
+      </ol>
+      {% if compare_ok and versions|length > 1 %}<button class="btn btn-secondary btn-sm" type="submit" form="compare-form" data-compare-submit>{{ icon('compare') }} Compare selected</button>{% endif %}
+    </section>
+  </aside>
+</div>
+
+<div class="modal" id="version-modal" hidden role="dialog" aria-modal="true" aria-labelledby="version-title">
+  <div class="modal-card">
+    <div class="modal-head"><h2 id="version-title">Upload New Version</h2><button class="icon-btn" data-modal-close aria-label="Close">&times;</button></div>
+    <form action="{{ url_for('documents.new_version', doc_id=doc.id) }}" method="post" enctype="multipart/form-data" data-upload-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="idempotency_key" value="">
+      <p class="muted">The current version ({{ cv.label if cv }}) is kept in the history. The new file must be a .{{ doc.extension }} file.</p>
+      <label class="dropzone" data-dropzone>
+        <input type="file" name="file" required accept="{{ accept }}">
+        {{ icon('upload-cloud') }}
+        <strong>Drop the updated file here or click to browse</strong>
+        <span class="dropzone-files"></span>
+      </label>
+      <fieldset class="field"><label>Version type</label>
+        <label class="check"><input type="radio" name="major" value="0" checked> Minor version</label>
+        <label class="check"><input type="radio" name="major" value="1"> Major version</label>
+      </fieldset>
+      <div class="field">
+        <label for="version-note">Change comment</label>
+        <input type="text" id="version-note" name="note" maxlength="500" placeholder="What changed?">
+      </div>
+      <div class="progress" hidden><div class="progress-bar"></div></div>
+      <p class="form-error" hidden></p>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">Upload version</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal" id="checkin-modal" hidden role="dialog" aria-modal="true" aria-labelledby="checkin-title">
+  <div class="modal-card">
+    <div class="modal-head"><h2 id="checkin-title">Check in</h2><button class="icon-btn" data-modal-close aria-label="Close">&times;</button></div>
+    <form action="{{ url_for('documents.checkin', doc_id=doc.id) }}" method="post" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="idempotency_key" value="">
+      <p class="muted">Upload your edited file to save it as a new version, or check in without changes. Either way the document is unlocked.</p>
+      <label class="dropzone" data-dropzone>
+        <input type="file" name="file" accept="{{ accept }}">
+        {{ icon('upload-cloud') }}
+        <strong>Edited file (optional)</strong>
+        <span class="dropzone-files"></span>
+      </label>
+      <fieldset class="field"><label>Version type</label>
+        <label class="check"><input type="radio" name="major" value="0" checked> Minor version</label>
+        <label class="check"><input type="radio" name="major" value="1"> Major version</label>
+      </fieldset>
+      <div class="field"><label for="checkin-note">Change comment</label><input type="text" id="checkin-note" name="note" maxlength="500"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">Check in</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

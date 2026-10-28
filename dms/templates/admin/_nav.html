@@ -1,0 +1,10 @@
+{% set ep = request.endpoint or '' %}
+<nav class="tabs" aria-label="Administration">
+  <a href="{{ url_for('admin.index') }}" class="{{ 'active' if ep == 'admin.index' }}">Overview</a>
+  <a href="{{ url_for('admin.users') }}" class="{{ 'active' if ep in ('admin.users', 'admin.user_edit', 'admin.user_new') }}">Users</a>
+  <a href="{{ url_for('admin.roles') }}" class="{{ 'active' if ep in ('admin.roles', 'admin.role_edit') }}">Roles</a>
+  <a href="{{ url_for('access.manage', kind='repository', obj_id=0) }}">Repository permissions</a>
+  <a href="{{ url_for('admin.metadata') }}" class="{{ 'active' if ep == 'admin.metadata' }}">Metadata &amp; tags</a>
+  <a href="{{ url_for('admin.settings_page') }}" class="{{ 'active' if ep == 'admin.settings_page' }}">Settings</a>
+  <a href="{{ url_for('admin.devices') }}" class="{{ 'active' if ep == 'admin.devices' }}">Devices</a>
+</nav>
