@@ -29,24 +29,25 @@ PERM_HELP = {
     "share": "Give other users or roles view, download or edit access",
     "manage": "Change permissions and inheritance (implies all of the above)",
 }
-SYSTEM_CAPS = ("admin", "records", "audit", "emails")
+# There is no email capability: every user archives their own Gmail mailbox and only they can see
+# those emails (services/emails.owned_email). A leftover "emails" value in roles.capabilities is ignored.
+SYSTEM_CAPS = ("admin", "records", "audit")
 CAP_LABELS = {
     "admin": "Administration (users, roles, settings; full access)",
     "records": "Records management (recycle bin, retention, check-out override)",
     "audit": "Audit (activity and security logs)",
-    "emails": "Email archive access",
 }
 
 # name -> (system capabilities, repository-level content permissions, description)
 PREDEFINED_ROLES = {
-    "Admin": ({"admin", "records", "audit", "emails"}, set(CONTENT_PERMS),
+    "Admin": ({"admin", "records", "audit"}, set(CONTENT_PERMS),
               "Full control of the system, users, roles and settings."),
-    "Records Manager": ({"records", "audit", "emails"}, set(CONTENT_PERMS),
+    "Records Manager": ({"records", "audit"}, set(CONTENT_PERMS),
                         "Manages the repository, recycle bin, retention and check-outs."),
     "Contributor": (set(), {"view", "download", "edit", "share"},
                     "Uploads and edits documents and creates folders."),
     "Reader": (set(), {"view", "download"}, "Views and downloads documents."),
-    "Auditor": ({"audit", "emails"}, {"view"}, "Read-only access to content and the audit trail."),
+    "Auditor": ({"audit"}, {"view"}, "Read-only access to content and the audit trail."),
 }
 
 ALL = frozenset(CONTENT_PERMS)

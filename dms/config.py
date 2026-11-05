@@ -7,7 +7,12 @@ import os
 import secrets
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Must run before the Config class body below reads os.environ.
+load_dotenv(BASE_DIR / ".env")
 
 
 def _bool(name, default=False):
@@ -47,11 +52,9 @@ class Config:
 
     INSTANCE_DIR = _path("DMS_INSTANCE_DIR", BASE_DIR / "instance")
     STORAGE_DIR = _path("DMS_STORAGE_DIR", BASE_DIR / "storage")
-    LEGACY_EMAIL_DIR = BASE_DIR / "emails"
 
-    SQLALCHEMY_DATABASE_URI = os.environ.get(
-        "DATABASE_URL", f"sqlite:///{(INSTANCE_DIR / 'dms.sqlite').as_posix()}"
-    )
+    # Required: mysql+pymysql://user:password@host:3306/DMS?charset=utf8mb4 (no fallback database).
+    SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", "")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
     # Uploads. DMS_MAX_UPLOAD_MB is the default per-file limit (administrators can change it and set
@@ -72,7 +75,6 @@ class Config:
         if origin.strip()
     )
     ANGULAR_FRONTEND_URL = _str("DMS_ANGULAR_FRONTEND_URL")
-    LEGACY_UI_ENABLED = False
     # Allow the first-administrator setup page from non-local addresses.
     ALLOW_REMOTE_SETUP = _bool("DMS_ALLOW_REMOTE_SETUP", False)
 
@@ -102,6 +104,13 @@ class Config:
 
     # Search: files larger than this are indexed by name/metadata only.
     SEARCH_EXTRACT_MAX_MB = _int("DMS_SEARCH_EXTRACT_MAX_MB", 50)
+    # OCR of images and scanned PDF pages for search. Used only when Tesseract is installed
+    # (TESSERACT_PATH, or `tesseract` on the PATH). Languages as in Tesseract, e.g. "eng+hin".
+    OCR_ENABLED = _bool("DMS_OCR_ENABLED", True)
+    TESSERACT_PATH = _str("TESSERACT_PATH")
+    OCR_LANGUAGES = _str("DMS_OCR_LANGUAGES", "eng")
+    OCR_MAX_PAGES = max(1, _int("DMS_OCR_MAX_PAGES", 20))
+    OCR_TIMEOUT_SECONDS = max(5, _int("DMS_OCR_TIMEOUT_SECONDS", 60))
 
     # Background maintenance (recycle-bin expiry, version retention)
     MAINTENANCE_ENABLED = _bool("DMS_MAINTENANCE_ENABLED", True)
@@ -135,12 +144,17 @@ class Config:
     SAML_ATTR_GROUPS = _str("SAML_ATTR_GROUPS", "groups")
     SAML_LABEL = _str("SAML_LABEL", "SAML single sign-on")
 
-    # Gmail
+    # Gmail. Every user connects their own mailbox; the OAuth tokens are stored encrypted in
+    # gmail_accounts.token_enc, and each user sees only the emails archived from their mailbox.
     GMAIL_CREDENTIALS_FILE = _path("GMAIL_CREDENTIALS_FILE", BASE_DIR / "credentials.json")
-    GMAIL_TOKEN_FILE = _path("GMAIL_TOKEN_FILE", BASE_DIR / "token.json")
     GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+    # Comma-separated Google domains users may connect (e.g. jmbaxi.com); empty allows any Gmail account.
+    GMAIL_ALLOWED_DOMAINS = [d.strip().lower().lstrip("@") for d in _str("GMAIL_ALLOWED_DOMAINS").split(",")
+                             if d.strip()]
     GMAIL_SYNC_ENABLED = _bool("GMAIL_SYNC_ENABLED", True)
     GMAIL_SYNC_INTERVAL_SECONDS = max(30, _int("GMAIL_SYNC_INTERVAL_SECONDS", 120))
+    # Mailboxes synchronised in parallel by each sync run.
+    GMAIL_SYNC_WORKERS = max(1, _int("GMAIL_SYNC_WORKERS", 4))
     # On first connection, also import up to N recently archived messages.
     GMAIL_INITIAL_BACKFILL = _int("GMAIL_INITIAL_BACKFILL", 0)
     # When Gmail history has expired, rescan archived mail from the last N days.
@@ -185,7 +199,6 @@ def oidc_provider_configs(names=None):
 
 class TestConfig(Config):
     TESTING = True
-    LEGACY_UI_ENABLED = True
     SECRET_KEY = "test-secret"
     WTF_CSRF_ENABLED = False
     GMAIL_SYNC_ENABLED = False

@@ -16,6 +16,7 @@ import nh3
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from .. import sp
 from ..extensions import db
 from ..models import ArchivedEmail, EmailAttachment, utcnow
 from ..storage import get_storage
@@ -251,10 +252,11 @@ def store_email(account, gmail_message_id, raw_bytes, *, thread_id=None, label_i
         db.session.flush()
         from .search import index_email
         index_email(record, raw_bytes)
-        log_activity("email", "archived", f"Archived email '{(meta['subject'] or '(no subject)')[:200]}'", record.id)
+        # The activity log is visible to auditors, so it names the mailbox but never the email's content.
+        log_activity("email", "archived", f"Archived an email from Gmail account {account.email}", record.id)
         if scan.status == "infected":
             log_activity("security", "malware_flagged",
-                         f"Archived email '{(meta['subject'] or '(no subject)')[:150]}' contains malware "
+                         f"An archived email from {account.email} contains malware "
                          f"({scan.detail}); attachment downloads are blocked", record.id)
         db.session.commit()
         return record, True
@@ -273,6 +275,30 @@ def store_email(account, gmail_message_id, raw_bytes, *, thread_id=None, label_i
         raise
 
 
+# ------------------------------------------------------------------- ownership (privacy)
+
+def owned_email(user, email_id):
+    """The archived email if it came from ``user``'s own mailbox, else None.
+
+    Nobody, administrators included, can open another user's archived emails.
+    """
+    if user is None or not email_id:
+        return None
+    row = sp.call_one("sp_email_get_owned", user.id, int(email_id), flush=False, expire=False)
+    return db.session.get(ArchivedEmail, row["id"]) if row else None
+
+
+def list_owned(user, q="", state="", with_attachments=False, sort="imported", limit=25, offset=0):
+    """(emails, total) from the user's own mailboxes, in the requested order."""
+    rows = sp.call("sp_email_list", user.id, q, state, int(bool(with_attachments)), sort, limit, offset,
+                   flush=False, expire=False)
+    total = rows[0]["total"] if rows else 0
+    ids = [r["id"] for r in rows if r["id"] is not None]
+    by_id = {e.id: e for e in db.session.execute(
+        select(ArchivedEmail).where(ArchivedEmail.id.in_(ids))).scalars()} if ids else {}
+    return [by_id[i] for i in ids if i in by_id], total
+
+
 def update_state(record, label_ids=None, deleted=False):
     new_state = "deleted" if deleted else state_from_labels(label_ids)
     if label_ids is not None:
@@ -281,8 +307,8 @@ def update_state(record, label_ids=None, deleted=False):
         old = record.gmail_state
         record.gmail_state = new_state
         record.state_updated_at = utcnow()
-        log_activity("email", "state_changed",
-                     f"Email '{(record.subject or '(no subject)')[:150]}': {old} → {new_state} in Gmail", record.id)
+        log_activity("email", "state_changed", f"Archived email #{record.id}: {old} → {new_state} in Gmail",
+                     record.id)
         return True
     return False
 

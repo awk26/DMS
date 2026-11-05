@@ -1,22 +1,11 @@
 import io
-from pathlib import Path
 
-from jinja2 import BaseLoader, TemplateNotFound
-
-import dms
-from dms import _register_api_cors, create_app
-from dms.config import Config, TestConfig
+from dms import _register_api_cors
 from dms.extensions import db
-from dms.models import GmailAccount, Role
+from dms.models import GmailAccount, Role, User
 from dms.services.emails import store_email
 
-from .conftest import make_user
-from .conftest import build_email
-
-
-class MissingTemplateLoader(BaseLoader):
-    def get_source(self, _environment, template):
-        raise TemplateNotFound(template)
+from .conftest import build_email, make_user
 
 
 def test_cookie_api_login_requires_csrf_and_authenticates(anon):
@@ -45,79 +34,17 @@ def test_cookie_api_login_requires_csrf_and_authenticates(anon):
     assert create.json["folder"]["name"] == "Angular-created"
 
 
-def test_api_is_available_without_template_loader(app, client, anon):
-    app.jinja_env.loader = MissingTemplateLoader()
-    response = client.get("/api/v1/me")
-    assert response.status_code == 200
-    assert response.json["username"] == "admin"
+def test_app_is_api_only_and_keeps_provider_callbacks(app, client, anon):
+    assert app.template_folder is None and app.static_folder is None
+    rules = {rule.rule for rule in app.url_map.iter_rules()}
+    assert {"/api/v1/auth/options", "/auth/oidc/<name>", "/auth/oidc/<name>/callback", "/auth/saml/acs",
+            "/auth/saml/metadata", "/gmail/oauth2callback"} <= rules
+    assert not [r for r in rules if not r.startswith(("/api/v1", "/auth/oidc", "/auth/saml", "/gmail/oauth2callback"))]
+    assert client.get("/api/v1/me").json["username"] == "admin"
     unauthorized = anon.get("/api/v1/me")
-    assert unauthorized.status_code == 401
-    assert unauthorized.is_json
-
-
-def test_app_starts_and_serves_api_with_missing_template_directory(monkeypatch, tmp_path):
-    flask_factory = dms.Flask
-
-    def flask_without_templates(import_name, **kwargs):
-        kwargs["template_folder"] = str(tmp_path / "does-not-exist")
-        return flask_factory(import_name, **kwargs)
-
-    monkeypatch.setattr(dms, "Flask", flask_without_templates)
-    app = create_app(
-        TestConfig,
-        SQLALCHEMY_DATABASE_URI=f"sqlite:///{(tmp_path / 'template-free.sqlite').as_posix()}",
-        INSTANCE_DIR=tmp_path / "instance",
-        STORAGE_DIR=tmp_path / "storage",
-        LEGACY_EMAIL_DIR=tmp_path / "legacy_emails",
-        GMAIL_TOKEN_FILE=tmp_path / "token.json",
-        GMAIL_CREDENTIALS_FILE=tmp_path / "credentials.json",
-        LEGACY_UI_ENABLED=False,
-    )
-    try:
-        response = app.test_client().get("/api/v1/auth/options")
-        assert response.status_code == 200
-        assert not (tmp_path / "does-not-exist").exists()
-    finally:
-        with app.app_context():
-            db.session.remove()
-            db.engine.dispose()
-
-
-def test_api_only_runtime_disables_ui_but_keeps_provider_callbacks(tmp_path):
-    assert Config.LEGACY_UI_ENABLED is False
-    app = create_app(
-        TestConfig,
-        SQLALCHEMY_DATABASE_URI=f"sqlite:///{(tmp_path / 'api-only.sqlite').as_posix()}",
-        INSTANCE_DIR=tmp_path / "instance",
-        STORAGE_DIR=tmp_path / "storage",
-        LEGACY_EMAIL_DIR=tmp_path / "legacy_emails",
-        GMAIL_TOKEN_FILE=tmp_path / "token.json",
-        GMAIL_CREDENTIALS_FILE=tmp_path / "credentials.json",
-        LEGACY_UI_ENABLED=False,
-    )
-    try:
-        assert app.template_folder is None
-        assert app.static_folder is None
-        rules = {rule.rule for rule in app.url_map.iter_rules()}
-        assert "/api/v1/auth/options" in rules
-        assert "/auth/oidc/<name>" in rules
-        assert "/auth/oidc/<name>/callback" in rules
-        assert "/auth/saml/acs" in rules
-        assert "/auth/saml/metadata" in rules
-        assert "/gmail/oauth2callback" in rules
-        assert "/dashboard" not in rules
-        assert "/documents/upload" not in rules
-        assert "static" not in {rule.endpoint for rule in app.url_map.iter_rules()}
-
-        client = app.test_client()
-        assert client.get("/api/v1/auth/options").status_code == 200
-        missing_ui = client.get("/dashboard")
-        assert missing_ui.status_code == 404
-        assert missing_ui.is_json
-    finally:
-        with app.app_context():
-            db.session.remove()
-            db.engine.dispose()
+    assert unauthorized.status_code == 401 and unauthorized.is_json
+    missing_ui = client.get("/dashboard")
+    assert missing_ui.status_code == 404 and missing_ui.is_json
 
 
 def test_cors_is_exact_origin_and_supports_credentials(app, client):
@@ -133,12 +60,6 @@ def test_cors_is_exact_origin_and_supports_credentials(app, client):
 
     denied = client.options("/api/v1/me", headers={"Origin": "https://unexpected.example"})
     assert "Access-Control-Allow-Origin" not in denied.headers
-
-
-def test_frontend_assets_remain_in_repository():
-    project = Path(__file__).resolve().parents[1]
-    assert (project / "dms" / "templates").is_dir()
-    assert (project / "dms" / "static").is_dir()
 
 
 def test_cookie_api_document_upload_search_and_download(client):
@@ -165,17 +86,18 @@ def test_cookie_api_document_upload_search_and_download(client):
     assert any(row["id"] == document["id"] for row in results.json["results"])
 
 
-def test_cookie_api_email_list_and_eml_download(client, app):
-    with app.app_context():
-        account = GmailAccount(email="api-test@example.com")
-        db.session.add(account)
-        db.session.commit()
-        record, _ = store_email(account, "api123", build_email(subject="API mail"))
-        email_id = record.id
+def test_cookie_api_email_list_and_eml_download(client, admin):
+    # Same app context (and database session) as the requests: a nested context would use another
+    # MySQL connection whose snapshot the requests' session cannot see.
+    account = GmailAccount(email="api-test@example.com", user_id=admin.id)  # only the owner sees it
+    db.session.add(account)
+    db.session.commit()
+    record, _ = store_email(account, "api123", build_email(subject="API mail"))
+    email_id = record.id
 
     listing = client.get("/api/v1/emails")
     assert listing.status_code == 200
-    assert any(item["id"] == email_id for item in listing.json["emails"])
+    assert any(item["id"] == email_id for item in listing.json["emails"]), listing.json
 
     download = client.get(f"/api/v1/emails/{email_id}/eml")
     assert download.status_code == 200
@@ -270,3 +192,24 @@ def test_api_version_history_operations(client):
                            headers={"X-CSRFToken": csrf})
     assert restored.status_code == 201
     assert restored.json["document"]["version"] == "2.1"
+
+
+def test_api_tokens_for_sync_and_mobile(app, admin):
+    from dms.security.auth import new_api_token
+    raw, _ = new_api_token(db.session.get(User, admin.id), "sync")
+    h = {"Authorization": f"Bearer {raw}"}
+    c = app.test_client()
+    assert c.get("/api/v1/me", headers=h).json["username"] == "admin"
+    r = c.post("/api/v1/documents", headers=h, data={"file": (io.BytesIO(b"from sync"), "sync.txt")},
+               content_type="multipart/form-data")
+    assert r.status_code == 201
+    doc_id = r.json["document"]["id"]
+    assert c.get(f"/api/v1/documents/{doc_id}/content", headers=h).data == b"from sync"
+    listing = c.get("/api/v1/documents?changed_since=2000-01-01T00:00:00Z", headers=h).json
+    assert any(d["id"] == doc_id for d in listing["documents"])
+    assert c.post(f"/api/v1/documents/{doc_id}/checkout", headers=h).status_code == 200
+    rtoken, _ = new_api_token(make_user("rita", ("Reader",), email="rita@example.com"), "phone")
+    r = c.post("/api/v1/documents", headers={"Authorization": f"Bearer {rtoken}"},
+               data={"file": (io.BytesIO(b"x"), "x.txt")}, content_type="multipart/form-data")
+    assert r.status_code == 403
+    assert c.get("/api/v1/me", headers={"Authorization": "Bearer dms_invalid"}).status_code == 401

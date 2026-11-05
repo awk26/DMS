@@ -1,11 +1,24 @@
+"""Shared test fixtures.
+
+Tests run against a dedicated MySQL database (MySQL is the only supported database).
+
+* ``TEST_DATABASE_URL`` selects it. When unset, the database from ``DATABASE_URL`` is used with
+  ``_test`` appended to its name (``DMS`` -> ``DMS_test``) on the same server.
+* The database name must end in ``_test`` and differ from ``DATABASE_URL``'s, because every table
+  in it is emptied after each test.
+* It is created if missing; tables are created and the stored procedures installed once per run.
+"""
 import base64
 import io
 import json
+import os
 from email.message import EmailMessage
 
 import httplib2
 import pytest
 from googleapiclient.errors import HttpError
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 
 from dms import create_app
 from dms.config import TestConfig
@@ -16,16 +29,98 @@ PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08
 PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 
+# ------------------------------------------------------------------- MySQL test database
+
+def _test_database_url():
+    explicit = os.environ.get("TEST_DATABASE_URL")
+    app_url = os.environ.get("DATABASE_URL", "")
+    if explicit:
+        url = make_url(explicit)
+    elif app_url:
+        base = make_url(app_url)
+        url = base.set(database=f"{base.database}_test")
+    else:
+        pytest.exit("Set TEST_DATABASE_URL (or DATABASE_URL) to a MySQL server to run the tests.", returncode=2)
+    if not url.drivername.startswith("mysql"):
+        pytest.exit(f"TEST_DATABASE_URL must be MySQL, got '{url.drivername}'.", returncode=2)
+    if not (url.database or "").endswith("_test"):
+        pytest.exit(f"Refusing to run: test database '{url.database}' must end in '_test' "
+                    "(every table in it is emptied after each test).", returncode=2)
+    if app_url and make_url(app_url).database == url.database \
+            and make_url(app_url).host == url.host:
+        pytest.exit("Refusing to run: TEST_DATABASE_URL points at the application database.", returncode=2)
+    return url
+
+
+TEST_DB_URL = _test_database_url()
+TEST_DB_URI = TEST_DB_URL.render_as_string(hide_password=False)
+
+
+def _paths(tmp_path):
+    return dict(INSTANCE_DIR=tmp_path, STORAGE_DIR=tmp_path / "storage",
+                GMAIL_TOKEN_FILE=tmp_path / "token.json", GMAIL_CREDENTIALS_FILE=tmp_path / "credentials.json")
+
+
+def make_test_app(tmp_path, config=TestConfig, **overrides):
+    """create_app() against the MySQL test database, with every file path under ``tmp_path``."""
+    return create_app(config, **{"SQLALCHEMY_DATABASE_URI": TEST_DB_URI, **_paths(tmp_path), **overrides})
+
+
+_admin_engine = None
+
+
+def _engine():
+    global _admin_engine
+    if _admin_engine is None:
+        _admin_engine = create_engine(TEST_DB_URL, pool_pre_ping=True)
+    return _admin_engine
+
+
+def _empty_all_tables():
+    with _engine().connect() as conn:
+        tables = [r[0] for r in conn.execute(text(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'"))]
+        conn.execute(text("SET SESSION lock_wait_timeout = 30"))
+        conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
+        try:
+            for table in tables:
+                conn.execute(text(f"TRUNCATE TABLE `{table}`"))
+        finally:
+            conn.execute(text("SET FOREIGN_KEY_CHECKS = 1"))
+        conn.commit()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def mysql_test_database(tmp_path_factory):
+    """Create the test database, its tables and stored procedures once per run."""
+    server = create_engine(TEST_DB_URL.set(database=""))
+    with server.connect() as conn:
+        conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{TEST_DB_URL.database}` "
+                          "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"))
+    server.dispose()
+    setup_app = make_test_app(tmp_path_factory.mktemp("db-setup"))  # create_all() + upgrade()
+    with setup_app.app_context():
+        from dms.sp import install_procedures
+        install_procedures()
+        db.session.remove()
+        db.engine.dispose()
+    _empty_all_tables()
+    yield
+    if _admin_engine is not None:
+        _admin_engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def clean_database():
+    """Every test starts from empty tables (apps re-seed the predefined roles on start-up)."""
+    yield
+    _empty_all_tables()
+
+
 @pytest.fixture
 def app(tmp_path):
-    app = create_app(
-        TestConfig,
-        SQLALCHEMY_DATABASE_URI=f"sqlite:///{(tmp_path / 'test.sqlite').as_posix()}",
-        INSTANCE_DIR=tmp_path, STORAGE_DIR=tmp_path / "storage",
-        LEGACY_EMAIL_DIR=tmp_path / "legacy_emails",
-        GMAIL_TOKEN_FILE=tmp_path / "token.json", GMAIL_CREDENTIALS_FILE=tmp_path / "credentials.json",
-        MAX_CONTENT_LENGTH=2 * 1024 * 1024,
-    )
+    app = make_test_app(tmp_path, MAX_CONTENT_LENGTH=2 * 1024 * 1024)
     with app.app_context():
         yield app
         db.session.remove()
@@ -72,20 +167,59 @@ def anon(app, admin):
     return app.test_client()
 
 
-def upload(client, name, data, folder_id=None, key=None, url="/documents/upload", note=None):
-    form = {"file": (io.BytesIO(data), name)}
-    if folder_id:
-        form["folder_id"] = str(folder_id)
-    if key:
-        form["idempotency_key"] = key
-    if note:
-        form["note"] = note
-    return client.post(url, data=form, content_type="multipart/form-data",
-                       headers={"Accept": "application/json", "X-Requested-With": "fetch"})
+class Api:
+    """Test client for /api/v1 bound to one user's personal access token (no session or CSRF needed)."""
+
+    def __init__(self, app, user):
+        from dms.security.auth import new_api_token
+        self.user = user
+        raw, _ = new_api_token(user, "tests")
+        self.client = app.test_client()
+        self.headers = {"Authorization": f"Bearer {raw}"}
+
+    def _call(self, method, url, **kw):
+        headers = {**self.headers, **kw.pop("headers", {})}
+        return getattr(self.client, method)("/api/v1" + url, headers=headers, **kw)
+
+    def get(self, url, **kw):
+        return self._call("get", url, **kw)
+
+    def post(self, url, json=None, **kw):
+        return self._call("post", url, json=json, **kw) if json is not None else self._call("post", url, **kw)
+
+    def patch(self, url, json=None, **kw):
+        return self._call("patch", url, json=json or {}, **kw)
+
+    def put(self, url, json=None, **kw):
+        return self._call("put", url, json=json or {}, **kw)
+
+    def delete(self, url, json=None, **kw):
+        return self._call("delete", url, json=json, **kw) if json is not None else self._call("delete", url, **kw)
+
+    def folder(self, name, parent=None):
+        r = self.post("/folders", json={"name": name, "parent_id": parent})
+        assert r.status_code == 201, r.json
+        return r.json["folder"]["id"]
+
+    def upload(self, name, data, folder_id=None, **fields):
+        form = {"file": (io.BytesIO(data), name), **{k: str(v) for k, v in fields.items()}}
+        if folder_id:
+            form["folder_id"] = str(folder_id)
+        return self.post("/documents", data=form, content_type="multipart/form-data")
+
+    def doc(self, name, data, folder_id=None, **fields):
+        r = self.upload(name, data, folder_id, **fields)
+        assert r.status_code == 201, r.json
+        return r.json["document"]["id"]
+
+    def version(self, doc_id, name, data, **fields):
+        form = {"file": (io.BytesIO(data), name), **{k: str(v) for k, v in fields.items()}}
+        return self.post(f"/documents/{doc_id}/versions", data=form, content_type="multipart/form-data")
 
 
-def post_json(client, url, data=None):
-    return client.post(url, data=data or {}, headers={"Accept": "application/json", "X-Requested-With": "fetch"})
+@pytest.fixture
+def api(app, admin):
+    return Api(app, admin)
 
 
 # ------------------------------------------------------------------- mocked Gmail API

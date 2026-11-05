@@ -326,6 +326,12 @@ class Document(TimestampMixin, db.Model):
     inherit_permissions: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="1")
     checked_out_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     checked_out_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # Optimistic locking: every ORM UPDATE of a document bumps this and only applies if nobody else
+    # changed the row since it was read (otherwise StaleDataError -> HTTP 409). Raw SQL / stored
+    # procedures that update documents bypass it, so document writes go through the ORM.
+    row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+
+    __mapper_args__ = {"version_id_col": row_version}
 
     folder: Mapped[Optional[Folder]] = relationship(back_populates="documents")
     versions: Mapped[list["DocumentVersion"]] = relationship(
@@ -430,10 +436,7 @@ class RecentItem(db.Model):
 # --------------------------------------------------------------------------- search
 
 class SearchEntry(db.Model):
-    """Extracted, searchable text for a document or an archived email.
-
-    On SQLite an FTS5 index (search_fts) is kept in sync with this table by triggers.
-    """
+    """Extracted, searchable text for a document or an archived email (MySQL FULLTEXT index ft_search)."""
     __tablename__ = "search_entries"
     __table_args__ = (UniqueConstraint("kind", "ref_id", name="uq_search_entry"),)
 
@@ -469,6 +472,10 @@ class GmailAccount(db.Model):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
+    # DMS user who connected the mailbox; only they can see its archived emails.
+    user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
+    # OAuth token JSON, encrypted with the master key (security.mfa.seal).
+    token_enc: Mapped[Optional[str]] = mapped_column(Text)
     history_id: Mapped[Optional[str]] = mapped_column(String(32))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     connected_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)

@@ -12,6 +12,17 @@ class ValidationError(Exception):
     """A user-correctable problem with the request."""
 
 
+class ConflictError(ValidationError):
+    """The item changed (or is being changed) by someone else since the request was prepared (HTTP 409).
+
+    ``current`` carries details the client can show or retry with, e.g. the current version.
+    """
+
+    def __init__(self, message, **current):
+        super().__init__(message)
+        self.current = current
+
+
 # extension -> (mime type, content checker name). Extensions an administrator allows that are not
 # listed here are accepted as application/octet-stream without a content check.
 KNOWN_TYPES = {

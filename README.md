@@ -5,20 +5,20 @@ stores documents with full major/minor version history, encrypts all content at 
 upload for malware, provides full-text search across documents and archived email, and archives
 emails from Gmail as complete, unmodified `.eml` files.
 
-The Flask app runs API-only by default. Angular and other clients use `/api/v1`; the legacy
-`dms/templates` and `dms/static` source files are retained in the repository but are not registered
-or served. OIDC, SAML, and Gmail provider callback endpoints remain available for OAuth redirects.
+The Flask app is a JSON API only. The user interface is the React app in `DMS-FE`, which calls
+`/api/v1`; the backend serves no HTML pages, templates or static files. OIDC, SAML, and Gmail provider
+callback endpoints remain available for OAuth redirects.
 
 ## BRD Phase 1 traceability
 
-All paths are under `/api/v1`. Acceptance tests that run against the API only (legacy UI disabled)
-are in `tests/test_api_brd.py`, one test per requirement group.
+All paths are under `/api/v1`. Acceptance tests are in `tests/test_api_brd.py`, one test per requirement
+group.
 
 | ID | Requirement | API endpoints | Implementation |
 |---|---|---|---|
 | FR-FLD-01 | Create, rename, move, copy, delete folders, unlimited depth | `POST /folders`, `PATCH /folders/{id}` (`name`, `parent_id`), `POST /folders/{id}/copy`, `DELETE /folders/{id}` | `services/folders.py` |
 | FR-FLD-02 | Permission inheritance with override at any level | `PATCH /permissions/{kind}/{id}/inheritance`, `POST .../grant`, `GET /permissions/{kind}/{id}` | `security/permissions.py`, `services/access.py` |
-| FR-FLD-03 | Naming conventions, invalid characters, duplicates | enforced on every create/rename/move/upload | `validation.validate_name`; `folder_name_pattern`, `document_name_pattern`, `name_max_length` settings |
+| FR-FLD-03 | Naming conventions, invalid characters, duplicates | enforced on every create/rename/move/upload (an upload whose name already exists in the folder is refused: upload it as a new version) | `validation.validate_name`; `folder_name_pattern`, `document_name_pattern`, `name_max_length` settings |
 | FR-FLD-04 | Breadcrumbs, favourites, recent items, shortcuts | `breadcrumbs` in `GET /folders/{id}`, `GET /folders/root` and `GET /documents/{id}`; `GET/PUT/DELETE /favourites`; `GET /recent`; `POST /documents/{id}/links`, `DELETE /documents/links/{id}`, `shortcuts` in folder listings | `services/documents.py` (`add_link`, `record_view`) |
 | FR-FLD-05 | Recycle bin, restorable for a configurable period (default 30 days) | `GET/DELETE /recycle-bin`, `POST /folders/{id}/restore`, `POST /documents/{id}/restore`, `.../purge`; `deleted_at`/`expires_at` on items | `services/retention.py` (expiry by the maintenance job), `recycle_bin_days` setting (minimum 30) |
 | FR-DOC-01 | Single/multiple upload, desktop sync client, mobile app | `POST /documents` (one or several `file` parts); personal access tokens (`POST /account/tokens`); `GET /documents?changed_since=` change feed | `services/documents.upload_document` |
@@ -31,10 +31,10 @@ are in `tests/test_api_brd.py`, one test per requirement group.
 | FR-VER-03 | View, download, compare, restore | `GET /documents/{id}/preview?version=N`, `GET /documents/{id}/content?version=N`, `GET /documents/{id}/compare?a=N&b=M` (side-by-side `rows` and `redline`), `POST /documents/{id}/versions/{n}/restore` | `services/compare.py` (text, PDF, Word, Excel, PowerPoint, OpenDocument, RTF) |
 | FR-VER-04 | Restore creates a new version | `POST /documents/{id}/versions/{n}/restore` | `restore_version` appends a new version |
 | FR-VER-05 | Version-retention rules | `PUT /admin/settings` (`version_keep_last`, `version_keep_years`), `PATCH /folders/{id}/retention`, `POST /admin/maintenance` | `services/retention.py` |
-| FR-SRC-01 | Full-text search across content, email bodies, attachments, metadata | `GET /search?q=` | SQLite FTS5 index (`services/search.py`, `services/text_extract.py`) |
+| FR-SRC-01 | Full-text search across content, email bodies, attachments, metadata | `GET /search?q=` | MySQL `search_entries` table (`services/search.py`); text from PDF and Office/ODF files, email bodies and attachments, plus OCR of images and scanned PDF pages when Tesseract is installed (`services/text_extract.py`) |
 | FR-SRC-02 | Boolean, wildcards, phrase, fuzzy, date/size/type filters | `GET /search` with `AND OR NOT -x "phrase" a* b?c word~ name:/body:/meta:` and `type`, `date_from`, `date_to`, `size_min`, `size_max`, `tag`, `folder_id`, `author_id` | `services/search.py` |
 | FR-SRC-03 | Security-trimmed results | all lists, search, favourites, recent, ZIP exports | `Resolver.visible_documents_clause` |
-| FR-SRC-04 | Facets, sorting, highlighting | `facets`, `sort=relevance|date|name|size`, `<mark>` in `snippet` | `services/search.py` |
+| FR-SRC-04 | Facets, sorting, highlighting | `facets`, `sort=relevance|date|name|size`, `<mark>` in `snippet` and `title_html` | `services/search.py` |
 | FR-MET-01 | System metadata and custom fields per document type or folder | `author`, `created_at`, `updated_at`, `size`, `extension`, `mime_type`, `version` on every document; `POST /admin/metadata/types`, `.../fields` | `services/metadata.py` |
 | FR-MET-02 | Controlled vocabularies, tags, mandatory fields at upload | `GET /metadata/schema?folder_id=&document_type_id=`, `POST /admin/metadata/vocabularies`, `.../tags`; `meta_<field id>` and `tags` on upload | required/choice fields validated at upload; `tags_controlled` setting |
 | FR-SEC-01 | RBAC with predefined and custom roles | `GET/POST/PATCH/DELETE /admin/roles`, `PATCH /admin/users/{id}` | Admin, Records Manager, Contributor, Reader, Auditor (`security/permissions.py`) |
@@ -83,7 +83,7 @@ The app has two separate areas, shown as separate groups in the sidebar:
 
 | Document Library | Email Archive |
 |---|---|
-| Files you upload. Documents have versions, live in folders and can be moved, renamed, copied, checked out, trashed and exported as a ZIP. | Emails imported from Gmail, stored as their original `.eml`. They are never versioned, edited or included in document ZIPs. Visible to roles with the *Email archive access* capability. |
+| Files you upload. Documents have versions, live in folders and can be moved, renamed, copied, checked out, trashed and exported as a ZIP. | Emails imported from Gmail, stored as their original `.eml`. They are never versioned, edited or included in document ZIPs. Visible only to the user whose Gmail mailbox they came from. |
 
 An email attachment can be copied into the library with **Save to Document Library** (the folder icon
 next to the attachment on the email page). This creates an independent document, which can then be
@@ -228,12 +228,12 @@ dms/
   services/             Business logic: documents, folders, access, metadata, search, preview, compare,
                         retention, settings, emails, activity
   gmail/                OAuth (auth.py), synchronisation (sync.py), background scheduler
-  routes/               Blueprints: dashboard, documents, folders, search, permissions, account, admin, auth,
-                        api, emails, gmail
-  templates/ static/    Web interface
+  routes/               api.py (the /api/v1 JSON API), auth.py (OIDC/SAML callbacks),
+                        gmail.py (Gmail OAuth callback), _helpers.py (file streaming, ZIP export)
   cli.py                flask commands (init-db, create-user, reindex, maintenance, encrypt-storage, ...)
-tests/                  Automated tests (tests/test_brd_requirements.py covers the BRD requirements)
-instance/               SQLite database and master.key (created automatically, not in source control)
+tests/                  Automated tests against a MySQL test database (tests/test_api_brd.py covers the BRD)
+database/               MySQL stored procedures (procedures.sql; install with `flask install-procedures`)
+instance/               master.key (created automatically, not in source control)
 storage/                Encrypted document versions, renditions and .eml files (not in source control)
 emails/                 .eml files saved by the earlier version; imported once, left in place
 ```
@@ -311,14 +311,20 @@ proxy in front and set `DMS_TRUSTED_PROXIES=1`), then set `DMS_FORCE_HTTPS=true`
 
 ### Connect Gmail
 
-As an administrator, open **Gmail Connection** in the sidebar and click **Connect Gmail**, then sign in with a test-user
-account. If an existing `token.json` is present (as in this installation), the account is already
-connected.
+**Every user connects their own mailbox.** Any signed-in user (not only administrators) opens
+**Gmail Connection** and clicks **Connect Gmail**, then signs in to Google with their own account. The
+OAuth token is stored encrypted (master key) in `gmail_accounts.token_enc`; there is no `token.json`.
+
+Privacy: archived emails belong to the user whose mailbox they came from. Only that user can list,
+open, search, download or import them; administrators, records managers and auditors cannot see other
+users' emails. Administrators see only each mailbox's sync status (`GET /api/v1/admin/gmail/accounts`),
+and the activity log never contains email subjects or content. A Gmail address can be connected by one
+DMS user only. Set `GMAIL_ALLOWED_DOMAINS=jmbaxi.com` to allow company mailboxes only.
 
 Alternative from the command line (opens a browser on the same machine):
 
 ```powershell
-flask --app app gmail-connect
+flask --app app gmail-connect <dms-username>
 ```
 
 On the first connection the app records Gmail's current position (its `historyId`). From then on,
@@ -331,9 +337,9 @@ Gmail does not notify external applications when you click **Archive**. Archivin
 message's `INBOX` label, and Gmail records that change in the mailbox history. The app works from
 that history:
 
-1. **Every `GMAIL_SYNC_INTERVAL_SECONDS`** (120 s by default), a background thread calls
-   `users.history.list` for changes since the last stored `historyId`. Only changes are fetched, never
-   the whole mailbox.
+1. **Every `GMAIL_SYNC_INTERVAL_SECONDS`** (120 s by default), a background thread goes through every
+   connected mailbox (`GMAIL_SYNC_WORKERS` in parallel) and calls `users.history.list` for changes since
+   that mailbox's last stored `historyId`. Only changes are fetched, never the whole mailbox.
 2. Messages whose `INBOX` label was removed are added to a durable import queue. The new `historyId`
    is saved in the same database transaction, so an interruption cannot lose a message.
 3. For each queued message, the app fetches `messages.get(format="raw")`, checks the message's
@@ -365,7 +371,7 @@ The background thread only runs while the web process runs. For a server deploym
 
 - **Single web process** (for example `waitress-serve` or one gunicorn worker): the built-in
   scheduler is enough. Keep the process running as a service (Windows service / NSSM, systemd, etc.).
-- **Several web workers**: a database lease ensures that only one sync runs at a time. For clarity,
+- **Several web workers**: a per-mailbox database lease ensures each mailbox is synced by one process at a time. For clarity,
   set `GMAIL_SYNC_ENABLED=false` for the web workers and run one dedicated worker:
   ```
   flask --app app gmail-worker
@@ -407,18 +413,26 @@ The background thread only runs while the web process runs. For a server deploym
 
 ## 8. Tests
 
+The tests run against a separate MySQL **test** database, never the application database:
+
+- `TEST_DATABASE_URL` selects it. When it is not set, the server and credentials from `DATABASE_URL` are
+  used with `_test` added to the database name (`DMS` -> `DMS_test`).
+- Its name must end in `_test` and differ from the application database: every table in it is emptied
+  after each test. The tests refuse to start otherwise.
+- It is created if missing (the MySQL account needs `CREATE` permission), and the tables and stored
+  procedures are (re)created at the start of every run.
+
 ```powershell
 python -m pytest
 ```
 
-- `tests/test_brd_requirements.py`: one or more acceptance tests per BRD requirement (folders, capture, preview,
-  check-out, malware, versions, compare, retention, search, metadata, RBAC, inheritance, share, LDAP, SAML, MFA,
-  encryption, IP/session/device policies, REST API, audit trail).
-- `tests/test_documents.py`, `test_folders.py`, `test_email_preview.py`, `test_security.py`: core
-  workflows, versioning, validation, sanitisation, CSRF.
-- `tests/test_document_library.py`: upload workflow, version history scenario, moves that keep
-  history, folder ZIP export, failed operations leaving no records or orphaned files, and
-  saving email attachments without changing the archived email.
+- `tests/test_api_brd.py`: one or more acceptance tests per BRD requirement through `/api/v1` (folders,
+  capture, preview, check-out, malware, versions, compare, retention, search, metadata, RBAC, inheritance,
+  sharing, SSO/MFA, encryption, IP/session policies).
+- `tests/test_api.py`: cookie and token authentication, CSRF, CORS, the API-only app, emails, admin.
+- `tests/test_sharing.py`: share levels and the "Shared with me" / "Shared by me" lists.
+- `tests/test_email_preview.py`: sanitised email bodies, inline images, email search and privacy.
+- `tests/test_security.py`: security headers, error bodies, storage path traversal and tamper detection.
 - `tests/test_gmail_sync_mocked.py`: Gmail synchronisation against a **mocked** Gmail API.
 - `tests/test_gmail_live.py`: **live**, read-only check against the real account in `token.json`.
   It is skipped by default. To run it:

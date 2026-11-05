@@ -14,34 +14,44 @@ def register_cli(app):
         db.create_all()
         click.echo(f"Database ready: {app.config['SQLALCHEMY_DATABASE_URI']}")
 
+    @app.cli.command("install-procedures")
+    def install_procedures():
+        """(Re)create the MySQL stored procedures from database/procedures.sql (safe to re-run)."""
+        from .sp import install_procedures as install
+        click.echo(f"Ran {install()} statement(s) from database/procedures.sql.")
+
     @app.cli.command("gmail-connect")
-    def gmail_connect():
-        """Authorize Gmail from this machine using a local browser window."""
+    @click.argument("username")
+    def gmail_connect(username):
+        """Connect a Gmail mailbox for USERNAME, using a browser window on this machine."""
         from .gmail.auth import console_authorize
-        from .gmail.sync import run_sync
-        console_authorize()
-        result = run_sync(trigger="connect")
-        click.echo(f"Connected: {result.account} ({result.status}) {result.message}")
+        from .gmail.sync import connect_mailbox
+        from .security.auth import find_user
+        user = find_user(username)
+        if user is None:
+            raise click.ClickException(f"Unknown user '{username}'")
+        result = connect_mailbox(user, console_authorize())
+        click.echo(f"Connected for {user.username}: {result.account} ({result.status}) {result.message}")
 
     @app.cli.command("gmail-sync")
     def gmail_sync():
-        """Run one Gmail synchronization (suitable for cron / Task Scheduler)."""
-        from .gmail.sync import run_sync
-        result = run_sync(trigger="cli")
-        click.echo(json.dumps(result.as_dict(), indent=2, default=str))
-        if result.status not in ("ok", "partial", "busy"):
+        """Synchronise every connected mailbox once (suitable for cron / Task Scheduler)."""
+        from .gmail.sync import sync_all
+        summary = sync_all(trigger="cli")
+        click.echo(json.dumps(summary, indent=2, default=str))
+        if summary["status"] not in ("ok", "partial"):
             raise SystemExit(1)
 
     @app.cli.command("gmail-worker")
     @click.option("--interval", type=int, default=None, help="Seconds between runs.")
     def gmail_worker(interval):
         """Run Gmail synchronization continuously in the foreground (separate worker process)."""
-        from .gmail.sync import run_sync
+        from .gmail.sync import sync_all
         interval = interval or app.config["GMAIL_SYNC_INTERVAL_SECONDS"]
         click.echo(f"Gmail sync worker running every {interval}s. Press Ctrl+C to stop.")
         while True:
-            result = run_sync(trigger="worker")
-            click.echo(f"[{time.strftime('%H:%M:%S')}] {result.status}: {result.message}")
+            summary = sync_all(trigger="worker")
+            click.echo(f"[{time.strftime('%H:%M:%S')}] {summary['status']}: {summary['message']}")
             db.session.remove()
             time.sleep(interval)
 

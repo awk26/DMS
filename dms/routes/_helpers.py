@@ -1,70 +1,16 @@
+"""File streaming and ZIP export helpers used by the API (routes/api.py)."""
 import re
 import unicodedata
-from functools import wraps
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 
-from flask import Response, abort, flash, g, jsonify, redirect, request
+from flask import Response, abort, request
 
-from .. import wants_json
 from ..extensions import db
 from ..security.permissions import resolver
-from ..services.folders import NotFound
 from ..storage import StorageError, get_storage
 from ..services.activity import log_activity
-from ..validation import ValidationError
 
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
-
-
-def safe_next(default):
-    """A same-site redirect target from the form/query, else ``default``."""
-    target = request.form.get("next") or request.args.get("next")
-    if target:
-        parsed = urlparse(target)
-        if not parsed.scheme and not parsed.netloc and target.startswith("/") and not target.startswith("//") \
-                and "\\" not in target:
-            return target
-    return default
-
-
-def ok(message, redirect_to, status=200, **data):
-    if wants_json():
-        return jsonify(ok=True, message=message, redirect=redirect_to, **data), status
-    flash(message, "success")
-    return redirect(redirect_to, code=303)
-
-
-def fail(message, redirect_to, status=400):
-    if wants_json():
-        return jsonify(ok=False, error=message), status
-    flash(message, "error")
-    return redirect(redirect_to, code=303)
-
-
-def handle_errors(fallback):
-    """Turn service-layer ValidationError/NotFound into user-facing responses.
-
-    ``fallback`` is a callable (taking the view kwargs) returning the redirect URL.
-    """
-    def deco(view):
-        @wraps(view)
-        def wrapper(*args, **kwargs):
-            try:
-                return view(*args, **kwargs)
-            except ValidationError as exc:
-                db.session.rollback()
-                return fail(str(exc), safe_next(fallback(**kwargs)), 400)
-            except NotFound as exc:
-                db.session.rollback()
-                if wants_json():
-                    return jsonify(ok=False, error=str(exc)), 404
-                abort(404, description=str(exc))
-        return wrapper
-    return deco
-
-
-def user():
-    return getattr(g, "user", None)
 
 
 def require(perm, obj=None, message=None):
@@ -73,11 +19,6 @@ def require(perm, obj=None, message=None):
         if obj is not None and not resolver().can("view", obj):
             abort(404, description="Not found.")  # do not reveal items the user cannot see
         abort(403, description=message or "You do not have permission to do this.")
-
-
-def require_visible(obj):
-    if not resolver().can("view", obj):
-        abort(404, description="Not found.")
 
 
 def _content_disposition(disposition, name):

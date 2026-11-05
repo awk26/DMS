@@ -15,10 +15,11 @@ import time
 from datetime import timedelta
 from functools import wraps
 
-from flask import abort, current_app, g, jsonify, redirect, request, session, url_for
+from flask import abort, current_app, g, has_request_context, jsonify, redirect, request, session
 from sqlalchemy import func, select
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from .. import sp
 from ..extensions import db
 from ..models import ApiToken, Role, User, UserDevice, utcnow
 from ..services import settings
@@ -29,11 +30,11 @@ from .permissions import PREDEFINED_ROLES, reset_resolver
 log = logging.getLogger(__name__)
 
 DEVICE_COOKIE = "dms_device"
-PUBLIC_ENDPOINTS = {"static", "auth.login", "auth.logout", "auth.setup", "auth.register", "auth.mfa", "auth.oidc_login",
-                    "auth.oidc_callback", "auth.saml_login", "auth.saml_acs", "auth.saml_complete", "auth.saml_metadata",
-                    "auth.device_pending", "auth.blocked", "auth_callbacks.oidc_login",
-                    "auth_callbacks.oidc_callback", "auth_callbacks.saml_login", "auth_callbacks.saml_acs",
-                    "auth_callbacks.saml_complete", "auth_callbacks.saml_metadata", "gmail_callback.callback"}
+# Non-API endpoints: identity-provider and Gmail OAuth redirects. Everything else is under /api/v1,
+# which authenticates itself (routes/api.py api_auth).
+PUBLIC_ENDPOINTS = {"auth_callbacks.oidc_login", "auth_callbacks.oidc_callback", "auth_callbacks.saml_login",
+                    "auth_callbacks.saml_acs", "auth_callbacks.saml_complete", "auth_callbacks.saml_metadata",
+                    "gmail_callback.callback"}
 _DUMMY_HASH = generate_password_hash("not-a-real-password")
 
 
@@ -57,15 +58,20 @@ def check_password_policy(password):
 
 
 def find_user(username):
+    """User by user name or email (sp_user_find_by_login), loaded for the rest of the request."""
     username = (username or "").strip().lower()
     if not username:
         return None
-    return db.session.execute(select(User).where(
-        (func.lower(User.username) == username) | (func.lower(User.email) == username))).scalars().first()
+    row = sp.call_one("sp_user_find_by_login", username, expire=False)
+    return db.session.get(User, row["id"]) if row else None
 
 
 def verify_local(username, password):
-    """Check a local password. Returns the user or None. Applies lockout."""
+    """Check a local password. Returns the user or None. Applies lockout.
+
+    A successful check does not reset the failure counter here: login_user() does that through
+    sp_user_login_success once the session starts.
+    """
     user = find_user(username)
     if user is None or user.auth_source != "local" or not user.password_hash:
         check_password_hash(_DUMMY_HASH, password or "")  # similar timing for unknown users
@@ -73,20 +79,15 @@ def verify_local(username, password):
     if user.locked_until and user.locked_until > utcnow():
         raise AuthError("This account is temporarily locked after repeated failed sign-ins. Try again later.")
     if check_password_hash(user.password_hash, password or ""):
-        user.failed_logins = 0
-        user.locked_until = None
         return user
     register_failure(user)
     return None
 
 
 def register_failure(user):
-    user.failed_logins = (user.failed_logins or 0) + 1
-    if user.failed_logins >= settings.get("lockout_threshold"):
-        user.locked_until = utcnow() + timedelta(minutes=settings.get("lockout_minutes"))
-        user.failed_logins = 0
-        log_activity("security", "account_locked", f"Account '{user.username}' locked after failed sign-ins",
-                     user.id)
+    """Count a failed sign-in and lock the account at the threshold (sp_user_login_failed)."""
+    sp.call("sp_user_login_failed", user.id, settings.get("lockout_threshold"), settings.get("lockout_minutes"),
+            client_ip() if has_request_context() else None)
     db.session.commit()
 
 
@@ -259,8 +260,8 @@ def login_user(user, method):
     session["mfa_ok"] = not user.mfa_enabled
     device = register_device(user)
     session["device_id"] = device.id
-    user.last_login_at = utcnow()
-    log_activity("security", "login", f"'{user.username}' signed in ({method})", user.id)
+    # Resets the failure counter, stamps last_login_at and writes the "login" activity entry.
+    sp.call("sp_user_login_success", user.id, method, client_ip())
     db.session.commit()
     g.user = user
     reset_resolver()
@@ -299,24 +300,16 @@ def _load_session_user():
     return user, None
 
 
-def _wants_json():
-    from .. import wants_json
-    return wants_json() or request.path.startswith("/api/")
-
-
-def _deny(status, message, redirect_to=None):
-    if _wants_json():
-        return jsonify(ok=False, error=message), status
-    if redirect_to:
-        if message:
-            from flask import flash
-            flash(message, "error")
-        return redirect(redirect_to)
-    abort(status, description=message)
+def _deny(status, message):
+    return jsonify(ok=False, error=message), status
 
 
 def enforce_request_security():
-    """before_request hook: transport, IP policy, authentication, MFA, device policy."""
+    """before_request hook: transport and IP policy for every request.
+
+    The API checks sessions, MFA and devices itself (routes/api.py api_auth). The provider callbacks
+    only need to know who is signed in, if anyone.
+    """
     g.user = None
     reset_resolver()
     settings.clear_cache()
@@ -328,40 +321,10 @@ def enforce_request_security():
     if not ip_allowed():
         log.warning("Request from %s blocked by IP allowlist", client_ip())
         return _deny(403, "Access from your network address is not permitted.")
-    endpoint = request.endpoint or ""
-    if endpoint.startswith("api."):
-        return None  # the API authenticates with bearer tokens (see routes/api.py)
-    if not endpoint and not cfg.get("LEGACY_UI_ENABLED"):
-        return None
-    if endpoint in PUBLIC_ENDPOINTS:
+    if (request.endpoint or "") in PUBLIC_ENDPOINTS:
         uid = session.get("uid")
         if uid:
             g.user = db.session.get(User, uid)
-        return None
-
-    if db.session.execute(select(func.count(User.id))).scalar() == 0:
-        return redirect(url_for("auth.setup"))
-
-    user, reason = _load_session_user()
-    if user is None:
-        nxt = request.full_path if request.method == "GET" else None
-        return _deny(401, reason or "Please sign in.", url_for("auth.login", next=nxt) if nxt else url_for("auth.login"))
-    if not session.get("mfa_ok"):
-        return _deny(401, "", url_for("auth.mfa"))
-
-    device = db.session.get(UserDevice, session.get("device_id") or 0)
-    problem = device_problem(user, device)
-    if problem:
-        session.clear()
-        if problem == "pending":
-            return _deny(403, "This device is waiting for administrator approval.", url_for("auth.device_pending"))
-        return _deny(403, "Access from this device is not permitted.", url_for("auth.blocked"))
-
-    g.user = user
-    if settings.get("mfa_required") and user.auth_source in ("local", "ldap") and not user.mfa_enabled \
-            and endpoint not in ("account.mfa_setup", "account.mfa_enable"):
-        return _deny(403, "Your organisation requires multi-factor authentication. Set it up to continue.",
-                     url_for("account.mfa_setup"))
     return None
 
 

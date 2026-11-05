@@ -1,9 +1,9 @@
 """In-process periodic Gmail synchronisation.
 
-A single daemon thread runs ``run_sync`` every GMAIL_SYNC_INTERVAL_SECONDS
-while the application is running. "Sync now" wakes the thread early. If
-several processes run the app, the database lease in ``run_sync`` ensures only
-one of them synchronises at a time.
+A single daemon thread runs ``sync_all`` (every connected mailbox) every
+GMAIL_SYNC_INTERVAL_SECONDS while the application is running. "Sync now" wakes
+the thread early. If several processes run the app, the per-mailbox database
+lease in ``sync_account`` ensures each mailbox is synchronised by one of them at a time.
 """
 import logging
 import threading
@@ -42,11 +42,11 @@ class SyncScheduler:
         return bool(self._thread and self._thread.is_alive())
 
     def run_once(self, trigger="scheduled"):
-        from .sync import run_sync
+        from .sync import sync_all
         with self.app.app_context():
             self.running_now = True
             try:
-                self.last_result = run_sync(trigger=trigger).as_dict()
+                self.last_result = sync_all(trigger=trigger)
             except Exception:  # never let the thread die
                 log.exception("Unexpected error in Gmail sync")
             finally:

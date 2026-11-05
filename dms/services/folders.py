@@ -196,23 +196,43 @@ def _reindex_subtree(folder):
                 search.index_document_meta(doc)
 
 
-def copy_folder(folder, new_parent, user=None):
-    """Recursively copy a folder, its subfolders and the current version of every document."""
+def copy_folder(folder, new_parent, user=None, res=None, report=None):
+    """Recursively copy a folder, its subfolders and the current version of every document.
+
+    With ``res`` (the copier's permission resolver) only what they may read is copied: subfolders
+    they cannot view and documents (or current versions) they cannot download are left out, so a
+    copy, which the copier then owns, never exposes restricted content. ``report["skipped"]``
+    receives the number of items left out.
+    """
     from .documents import copy_document
     if new_parent is not None and is_descendant(new_parent, folder):
         raise ValidationError("A folder cannot be copied into itself or one of its subfolders.")
     created_keys = []
+    skipped = 0
+
+    def readable(doc):
+        if res is None:
+            return True
+        cv = doc.current_version
+        return res.can("download", doc) and (cv is None or "download" in res.version(cv))
 
     def walk(src, parent):
+        nonlocal skipped
         copy = Folder(name=_unique_name(src.name, parent.id if parent else None) if parent is new_parent else src.name,
                       parent=parent, created_by_id=user.id if user else None)
         db.session.add(copy)
         db.session.flush()
         for doc in sorted(src.documents, key=lambda d: d.name.lower()):
             if doc.deleted_at is None:
+                if not readable(doc):
+                    skipped += 1
+                    continue
                 new_doc = copy_document(doc, copy, user, commit=False)
                 created_keys.append(new_doc.current_version.storage_key)
         for child in src.live_children:
+            if res is not None and not res.can("view", child):
+                skipped += 1
+                continue
             walk(child, copy)
         return copy
 
@@ -222,8 +242,11 @@ def copy_folder(folder, new_parent, user=None):
         grant_owner(top, user)
         log_folder(top, "created", copied_from=folder.path)
         log_folder(new_parent, "subfolder_added", folder=top.name, folder_id=top.id)
-        log_activity("folder", "copied", f"Folder '{folder.path}' copied to '{top.path}'", top.id)
+        note = f" ({skipped} restricted item(s) not copied)" if skipped else ""
+        log_activity("folder", "copied", f"Folder '{folder.path}' copied to '{top.path}'{note}", top.id)
         db.session.commit()
+        if report is not None:
+            report["skipped"] = skipped
         return top
     except Exception:
         db.session.rollback()
@@ -232,11 +255,22 @@ def copy_folder(folder, new_parent, user=None):
         raise
 
 
-def delete_folder(folder, user=None):
-    """Move a folder with everything in it to the recycle bin (restorable as one unit)."""
+def delete_folder(folder, user=None, res=None):
+    """Move a folder with everything in it to the recycle bin (restorable as one unit).
+
+    With ``res`` (the user's permission resolver) the user needs delete permission on every
+    subfolder and on every document inside, including documents with their own permissions.
+    """
     from .documents import ensure_unlocked, trash_document
     nodes = subtree(folder)
     _ensure_not_system(nodes, "deleted")
+    if res is not None:
+        for node in nodes:
+            if not res.can("delete", node):
+                raise ValidationError(f"You do not have permission to delete the subfolder '{node.path}'.")
+            for doc in node.documents:
+                if doc.deleted_at is None and not res.can("delete", doc):
+                    raise ValidationError(f"You do not have permission to delete '{doc.name}' in '{node.path}'.")
     for node in nodes:
         for doc in node.documents:
             if doc.deleted_at is None:

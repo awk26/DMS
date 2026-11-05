@@ -16,15 +16,17 @@ import re
 import secrets
 
 from flask import Blueprint, Response, abort, current_app, g, jsonify, request, send_file, session, url_for
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm.exc import StaleDataError
 from werkzeug.datastructures import MultiDict
 from werkzeug.datastructures import FileStorage
 
+from .. import sp
 from ..extensions import db
 from ..models import (
     AccessEntry,
     ApiToken,
-    ArchivedEmail,
     Document,
     DocumentType,
     DocumentLink,
@@ -70,12 +72,11 @@ from ..services.folders import (
     purge_folder,
     rename_folder,
     restore_folder,
-    subtree,
 )
 from ..services.compare import compare_versions, supported as compare_supported
 from ..services.preview import html_rendition, office_preview_mode, pdf_rendition
 from ..services.retention import recycle_expiry
-from ..validation import NEVER_INLINE, ValidationError, preview_kind
+from ..validation import NEVER_INLINE, ConflictError, ValidationError, preview_kind
 from ..services.recycle_bin import can_manage_trashed, recycle_bin_items
 from ..services.users import apply_user_data
 from ._helpers import folder_zip_response, send_version, stream_stored
@@ -115,6 +116,12 @@ def _integer(value, name, minimum=None):
     if minimum is not None and result < minimum:
         raise ValidationError(f"{name} must be at least {minimum}.")
     return result
+
+
+def _base_version(form):
+    """Optional ``base_version``: the version number the client last saw (optimistic locking)."""
+    raw = form.get("base_version")
+    return _integer(raw, "base_version", 1) if raw not in (None, "") else None
 
 
 def _query_integer(name):
@@ -171,6 +178,21 @@ def api_auth(view):
         reset_resolver()
         try:
             return view(*args, **kwargs)
+        except ConflictError as exc:
+            db.session.rollback()
+            return jsonify(ok=False, error=str(exc), code="conflict", **exc.current), 409
+        except StaleDataError:
+            # Optimistic locking: another request changed this row since it was read (documents.row_version).
+            db.session.rollback()
+            return jsonify(ok=False, code="conflict",
+                           error="This item was changed by someone else at the same time. Reload it and try again."), 409
+        except OperationalError as exc:
+            # MySQL deadlock (1213) or lock wait timeout (1205): the transaction was rolled back, nothing saved.
+            if getattr(exc.orig, "args", (None,))[0] not in (1205, 1213):
+                raise
+            db.session.rollback()
+            return jsonify(ok=False, code="conflict",
+                           error="Someone else is changing this item right now. Nothing was saved; try again."), 409
         except ValidationError as exc:
             db.session.rollback()
             return jsonify(ok=False, error=str(exc), code="validation_error"), 400
@@ -345,18 +367,11 @@ def initial_setup():
     if password != (data.get("password2") or ""):
         raise ValidationError("The passwords do not match.")
     check_password_policy(password)
-    from ..security.auth import role_by_name
-    admin = role_by_name("Admin")
-    if admin is None:
-        raise ValidationError("The predefined Admin role is unavailable.")
-    user = User(username=username, email=(data.get("email") or "").strip().lower() or None,
-                display_name=(data.get("display_name") or "").strip()[:200],
-                password_hash=hash_password(password), roles=[admin])
-    db.session.add(user)
-    db.session.flush()
-    log_activity("admin", "setup", f"Initial administrator '{username}' created", user.id)
+    user_id = sp.call_one("sp_user_create", username, data.get("email"), (data.get("display_name") or "").strip(),
+                          hash_password(password), "local", "Admin")["user_id"]
+    log_activity("admin", "setup", f"Initial administrator '{username}' created", user_id)
     db.session.commit()
-    return jsonify(ok=True, user={"id": user.id, "username": user.username}), 201
+    return jsonify(ok=True, user={"id": user_id, "username": username}), 201
 
 
 @bp.post("/auth/register")
@@ -378,8 +393,6 @@ def register():
         raise ValidationError("Enter a valid email address.")
     if not re.match(r"^[a-z0-9][a-z0-9._-]{2,59}$", username):
         raise ValidationError("User names must be 3–60 characters and use lower-case letters, digits, dots, hyphens or underscores.")
-    if find_user(username) is not None or find_user(email) is not None:
-        raise ValidationError("An account with this user name or email already exists.")
     if password != (data.get("password2") or ""):
         raise ValidationError("The passwords do not match.")
     check_password_policy(password)
@@ -387,12 +400,12 @@ def register():
     role = role_by_name(settings.get("signup_default_role")) or role_by_name("Contributor")
     if role and role.capability_set & {"admin", "records"}:
         role = role_by_name("Contributor")
-    user = User(username=username, email=email, display_name=display_name,
-                password_hash=hash_password(password), roles=[role] if role else [])
-    db.session.add(user)
-    db.session.flush()
-    log_activity("security", "signup", f"'{username}' created an account", user.id)
+    # sp_user_create also rejects a user name or email that is already taken.
+    user_id = sp.call_one("sp_user_create", username, email, display_name, hash_password(password), "local",
+                          role.name if role else None)["user_id"]
+    log_activity("security", "signup", f"'{username}' created an account", user_id)
     db.session.commit()
+    user = db.session.get(User, user_id)
     device = login_user(user, "password")
     problem = device_problem(user, device)
     if problem:
@@ -436,7 +449,7 @@ def _doc_json(d):
         "version": cv.label if cv else None, "version_number": cv.version_number if cv else None,
         "author": d.created_by.username if d.created_by else None,
         "created_at": d.created_at.isoformat() + "Z", "updated_at": d.updated_at.isoformat() + "Z",
-        "deleted": d.deleted_at is not None,
+        "deleted": d.deleted_at is not None, "row_version": d.row_version,
         "checked_out_by": d.checked_out_by.username if d.checked_out_by else None,
         "checked_out_at": _iso(d.checked_out_at),
         "tags": [t.name for t in d.tags], "document_type": d.document_type.name if d.document_type else None,
@@ -614,8 +627,10 @@ def copy_folder_api(folder_id):
     _need("download", folder)
     destination = get_folder(data.get("parent_id"))
     _need("edit", destination)
-    copied = copy_folder(folder, destination, g.user)
-    return jsonify(ok=True, folder=_folder_json(copied)), 201
+    report = {}
+    copied = copy_folder(folder, destination, g.user, res=resolver(), report=report)
+    # skipped = items inside the folder that the user may not read, which were left out.
+    return jsonify(ok=True, folder=_folder_json(copied), skipped=report.get("skipped", 0)), 201
 
 
 @bp.patch("/folders/<int:folder_id>/retention")
@@ -645,16 +660,9 @@ def update_folder_retention(folder_id):
 def remove_folder(folder_id):
     folder = get_folder(folder_id)
     _need("delete", folder)
-    res = resolver()
-    for node in folder_tree_subtree(folder):
-        if "delete" not in res.folder(node):
-            raise ValidationError(f"You do not have permission to delete the subfolder '{node.path}'.")
-    delete_folder(folder, g.user)
+    # Checks delete permission on every subfolder and every document inside.
+    delete_folder(folder, g.user, res=resolver())
     return jsonify(ok=True)
-
-
-def folder_tree_subtree(folder):
-    return subtree(folder)
 
 
 @bp.post("/folders/<int:folder_id>/restore")
@@ -854,25 +862,31 @@ def upload():
     document_type = meta_svc.document_type_from_form(form)
     values = meta_svc.values_from_form(form, folder, document_type.id if document_type else None)
     tags = meta_svc.resolve_tags(meta_svc.parse_tags(form.get("tags")))
+    # A file whose name already exists in the folder becomes that document's next version.
     if len(files) > 1:
         # Several files in one request: each is an independent upload with its own outcome.
-        done, errors = [], []
+        done, versioned, errors = [], [], []
         for file in files:
             try:
-                doc, _ = svc.upload_document(file, folder, note=form.get("note"), user=g.user,
-                                             document_type=document_type, metadata=values, tags=tags)
+                doc, _, version = svc.upload_document(file, folder, note=form.get("note"), user=g.user,
+                                                      document_type=document_type, metadata=values, tags=tags)
                 done.append(doc)
+                if version is not None:
+                    versioned.append({"document_id": doc.id, "name": doc.name, "version": version.label})
             except ValidationError as exc:
                 db.session.rollback()
                 errors.append({"filename": file.filename, "error": str(exc)})
         if not done:
             return jsonify(ok=False, error="None of the files could be uploaded.", code="validation_error",
                            documents=[], errors=errors), 400
-        return jsonify(ok=True, documents=[_doc_json(doc) for doc in done], errors=errors), 201
-    doc, created = svc.upload_document(files[0], folder, form.get("idempotency_key"),
-                                       form.get("note"), user=g.user, document_type=document_type,
-                                       metadata=values, tags=tags)
-    return jsonify(ok=True, created=created, document=_doc_json(doc)), 201 if created else 200
+        return jsonify(ok=True, documents=[_doc_json(doc) for doc in done], versioned=versioned,
+                       errors=errors), 201
+    doc, created, version = svc.upload_document(files[0], folder, form.get("idempotency_key"),
+                                                form.get("note"), user=g.user, document_type=document_type,
+                                                metadata=values, tags=tags)
+    return jsonify(ok=True, created=created, versioned=version is not None,
+                   version=version.label if version else None, document=_doc_json(doc)), \
+        201 if (created or version is not None) else 200
 
 
 @bp.post("/documents/<int:doc_id>/versions")
@@ -882,7 +896,8 @@ def new_version(doc_id):
     _need("edit", doc)
     form = _body()
     version, created = svc.add_version(doc, request.files.get("file"), form.get("idempotency_key"),
-                                       form.get("note"), user=g.user, major=form.get("major") in ("1", "true", True))
+                                       form.get("note"), user=g.user, major=form.get("major") in ("1", "true", True),
+                                       base_version=_base_version(form))
     return jsonify(ok=True, created=created, version=version.label, document=_doc_json(doc)), 201 if created else 200
 
 
@@ -902,7 +917,8 @@ def checkin(doc_id):
     _need("edit", doc)
     form = _body()
     version = svc.checkin(doc, g.user, request.files.get("file"), form.get("note"),
-                          major=form.get("major") in ("1", "true", True), idempotency_key=form.get("idempotency_key"))
+                          major=form.get("major") in ("1", "true", True), idempotency_key=form.get("idempotency_key"),
+                          base_version=_base_version(form))
     return jsonify(ok=True, version=version.label if version else None, document=_doc_json(doc))
 
 
@@ -921,6 +937,14 @@ def update_document(doc_id):
     data = _body()
     doc = svc.get_document(doc_id)
     _need("edit", doc)
+    # Optimistic locking: a client that sends the row_version it loaded gets 409 instead of
+    # overwriting a change someone else saved in the meantime.
+    if data.get("row_version") not in (None, ""):
+        expected = _integer(data.get("row_version"), "row_version", 1)
+        if expected != doc.row_version:
+            raise ConflictError(f"'{doc.name}' was changed by someone else since you opened it. "
+                                "Reload it to see the latest details, then make your change again.",
+                                row_version=doc.row_version)
     if "name" in data:
         svc.rename_document(doc, data.get("name", ""), g.user)
     if "folder_id" in data:
@@ -966,7 +990,8 @@ def restore_document_version(doc_id, number):
     form = _body()
     restored, created = svc.restore_version(
         doc, number, form.get("idempotency_key"), user=g.user,
-        major=form.get("major") in ("1", "true", True), note=form.get("note")
+        major=form.get("major") in ("1", "true", True), note=form.get("note"),
+        base_version=_base_version(form),
     )
     return jsonify(ok=True, created=created, version=restored.label, document=_doc_json(doc)), \
         (201 if created else 200)
@@ -1062,6 +1087,7 @@ def search():
         "kind": hit.kind,
         "id": hit.obj.id,
         "title": hit.obj.name if hit.kind == "document" else hit.obj.subject,
+        "title_html": hit.title_html,  # name/subject with matched terms in <mark>
         "snippet": hit.snippet_html,
         "date": hit.date.isoformat() + "Z" if hit.date else None,
         "size": hit.size,
@@ -1128,56 +1154,40 @@ def directory():
 @bp.get("/emails")
 @api_auth
 def emails():
-    _need_emails()
+    """The signed-in user's own archived emails (nobody sees another user's mailbox)."""
     args = request.args
-    q = (args.get("q") or "").strip()
+    q = (args.get("q") or "").strip()[:200]
     state = args.get("state") or ""
     sort = args.get("sort") if args.get("sort") in ("received", "imported", "subject", "sender") else "imported"
-    stmt = select(ArchivedEmail)
-    if q:
-        like = f"%{q}%"
-        stmt = stmt.where(or_(ArchivedEmail.subject.ilike(like), ArchivedEmail.sender.ilike(like),
-                              ArchivedEmail.recipients.ilike(like), ArchivedEmail.snippet.ilike(like)))
-    if state:
-        if state not in EMAIL_STATES:
-            raise ValidationError("state must be one of: " + ", ".join(EMAIL_STATES))
-        stmt = stmt.where(ArchivedEmail.gmail_state == state)
-    if args.get("attachments") == "1":
-        stmt = stmt.where(ArchivedEmail.attachment_count > 0)
-    total = db.session.execute(select(func.count()).select_from(stmt.subquery())).scalar()
-    col = {"received": ArchivedEmail.received_at, "imported": ArchivedEmail.imported_at,
-           "subject": func.lower(ArchivedEmail.subject), "sender": func.lower(ArchivedEmail.sender)}[sort]
+    if state and state not in EMAIL_STATES:
+        raise ValidationError("state must be one of: " + ", ".join(EMAIL_STATES))
     page = max(1, args.get("page", 1, type=int))
     per_page = min(100, max(1, args.get("per_page", 25, type=int)))
-    rows = db.session.execute(stmt.order_by(col.asc() if sort in ("subject", "sender") else col.desc(),
-                                            ArchivedEmail.id.desc())
-                              .limit(per_page).offset((page - 1) * per_page)).scalars().all()
+    rows, total = email_svc.list_owned(g.user, q, state, args.get("attachments") == "1", sort,
+                                       per_page, (page - 1) * per_page)
     return jsonify(emails=[_email_json(record) for record in rows], total=total,
                    page=page, per_page=per_page)
 
 
-def _need_emails():
-    if not g.user.has("emails"):
-        abort(403, description="You do not have access to the email archive.")
+def _own_email(email_id):
+    """The email if it is in the signed-in user's own archive; 404 otherwise, so others' ids are not revealed."""
+    record = email_svc.owned_email(g.user, email_id)
+    if record is None:
+        raise NotFound("Email not found.")
+    return record
 
 
 @bp.get("/emails/<int:email_id>")
 @api_auth
 def email_detail(email_id):
-    _need_emails()
-    record = db.session.get(ArchivedEmail, email_id)
-    if record is None:
-        raise NotFound("Email not found.")
+    record = _own_email(email_id)
     return jsonify(email=_email_json(record))
 
 
 @bp.get("/emails/<int:email_id>/body")
 @api_auth
 def email_body(email_id):
-    _need_emails()
-    record = db.session.get(ArchivedEmail, email_id)
-    if record is None:
-        raise NotFound("Email not found.")
+    record = _own_email(email_id)
     try:
         html_doc = email_svc.render_preview_html(
             record, lambda idx: url_for("api.email_inline_part", email_id=record.id, part_index=idx)
@@ -1190,10 +1200,7 @@ def email_body(email_id):
 @bp.get("/emails/<int:email_id>/eml")
 @api_auth
 def email_eml(email_id):
-    _need_emails()
-    record = db.session.get(ArchivedEmail, email_id)
-    if record is None:
-        raise NotFound("Email not found.")
+    record = _own_email(email_id)
     name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", record.subject or "").strip(" .")[:80] or "message"
     return stream_stored(record.storage_key, "message/rfc822", f"{name} [{record.gmail_message_id}].eml",
                          as_attachment=True, etag=record.sha256)
@@ -1202,10 +1209,7 @@ def email_eml(email_id):
 @bp.get("/emails/<int:email_id>/attachments/<int:part_index>")
 @api_auth
 def email_attachment(email_id, part_index):
-    _need_emails()
-    record = db.session.get(ArchivedEmail, email_id)
-    if record is None:
-        raise NotFound("Email not found.")
+    record = _own_email(email_id)
     if record.scan_status == "infected":
         abort(403, description="This email was flagged as containing malware; its attachments cannot be downloaded.")
     attachment = db.session.execute(select(EmailAttachment).where(
@@ -1224,10 +1228,7 @@ def email_attachment(email_id, part_index):
 @bp.get("/emails/<int:email_id>/inline/<int:part_index>")
 @api_auth
 def email_inline_part(email_id, part_index):
-    _need_emails()
-    record = db.session.get(ArchivedEmail, email_id)
-    if record is None:
-        raise NotFound("Email not found.")
+    record = _own_email(email_id)
     attachment = db.session.execute(select(EmailAttachment).where(
         EmailAttachment.email_id == record.id, EmailAttachment.part_index == part_index
     )).scalar_one_or_none()
@@ -1244,13 +1245,10 @@ def email_inline_part(email_id, part_index):
 @bp.post("/documents/import-email-attachment")
 @api_auth
 def import_email_attachment():
-    _need_emails()
     data = _body()
     email_id = _integer(data.get("email_id"), "email_id", 1)
     part_index = _integer(data.get("part_index"), "part_index", 0)
-    record = db.session.get(ArchivedEmail, email_id)
-    if record is None:
-        raise NotFound("Email not found.")
+    record = _own_email(email_id)
     if record.scan_status == "infected":
         raise ValidationError("This email was flagged as containing malware; its attachments cannot be imported.")
     attachment = db.session.execute(select(EmailAttachment).where(
@@ -1265,11 +1263,13 @@ def import_email_attachment():
     _need("edit", folder)
     file = FileStorage(stream=io.BytesIO(content), filename=attachment.filename)
     subject = (record.subject or "(no subject)")[:200]
-    doc, created = svc.upload_document(
+    doc, created, version = svc.upload_document(
         file, folder, data.get("idempotency_key"),
         note=f"Imported from archived email: {subject}", user=g.user,
     )
-    return jsonify(ok=True, created=created, document=_doc_json(doc)), (201 if created else 200)
+    return jsonify(ok=True, created=created, versioned=version is not None,
+                   version=version.label if version else None, document=_doc_json(doc)), \
+        (201 if (created or version is not None) else 200)
 
 
 @bp.get("/favourites")
@@ -1326,9 +1326,23 @@ def remove_favourite(kind, target_id):
     return jsonify(ok=True, favourite=False)
 
 
+def _shared_target(entry):
+    """The live folder/document an access entry points at, or None if it is gone or in the recycle bin."""
+    model = Folder if entry.target_type == "folder" else Document
+    item = db.session.get(model, entry.target_id)
+    return None if item is None or item.deleted_at is not None else item
+
+
+def _counts(items):
+    folders = sum(1 for i in items if i["type"] == "folder")
+    return {"folders": folders, "documents": len(items) - folders, "total": len(items)}
+
+
 @bp.get("/shared")
 @api_auth
 def shared_items():
+    """``items``: what other people shared with the current user. ``shared_by_me``: what the
+    current user shared with other users, one row per folder/document with its recipients."""
     entries = db.session.execute(select(AccessEntry).where(
         AccessEntry.principal_type == "user", AccessEntry.principal_id == g.user.id,
         AccessEntry.target_type.in_(("folder", "document"))
@@ -1337,20 +1351,55 @@ def shared_items():
     for entry in entries:
         if entry.created_by_id == g.user.id:
             continue
-        model = Folder if entry.target_type == "folder" else Document
-        item = db.session.get(model, entry.target_id)
-        if item is None or item.deleted_at is not None or item.created_by_id == g.user.id \
-                or getattr(item, "id", None) == g.user.home_folder_id or "view" not in resolver().perms(item):
+        item = _shared_target(entry)
+        # The home-folder check only applies to folders: document and folder ids come from
+        # different tables, so comparing a document id with home_folder_id hid real shares.
+        if item is None or item.created_by_id == g.user.id \
+                or (entry.target_type == "folder" and item.id == g.user.home_folder_id) \
+                or "view" not in resolver().perms(item):
             continue
         sharer = db.session.get(User, entry.created_by_id) if entry.created_by_id else None
         result.append({
             "type": entry.target_type,
             "id": item.id,
             "shared_by": sharer.label if sharer else None,
+            "shared_at": _iso(entry.created_at),
             "permissions": sorted(resolver().perms(item)),
             "item": _folder_json(item) if entry.target_type == "folder" else _doc_json(item),
         })
-    return jsonify(items=result)
+
+    mine = db.session.execute(select(AccessEntry).where(
+        AccessEntry.created_by_id == g.user.id, AccessEntry.principal_type == "user",
+        AccessEntry.principal_id != g.user.id, AccessEntry.target_type.in_(("folder", "document"))
+    ).order_by(AccessEntry.created_at.desc())).scalars().all()
+    by_target = {}
+    for entry in mine:
+        key = (entry.target_type, entry.target_id)
+        if key not in by_target:
+            item = _shared_target(entry)
+            if item is None or "view" not in resolver().perms(item):
+                by_target[key] = None
+                continue
+            by_target[key] = {
+                "type": entry.target_type,
+                "id": item.id,
+                "shared_at": _iso(entry.created_at),
+                "permissions": sorted(resolver().perms(item)),
+                "item": _folder_json(item) if entry.target_type == "folder" else _doc_json(item),
+                "shared_with": [],
+            }
+        row = by_target[key]
+        if row is None:
+            continue
+        person = db.session.get(User, entry.principal_id)
+        row["shared_with"].append({
+            "id": entry.principal_id,
+            "name": person.label if person else "(removed user)",
+            "level": access_svc.level_of(entry.permission_set),
+        })
+    shared_by_me = [row for row in by_target.values() if row is not None]
+    return jsonify(items=result, shared_by_me=shared_by_me,
+                   counts={"shared_with_me": _counts(result), "shared_by_me": _counts(shared_by_me)})
 
 
 @bp.get("/recycle-bin")
@@ -1570,11 +1619,11 @@ def dashboard():
     res = resolver()
     visible = res.visible_documents_clause()
     active = Document.deleted_at.is_(None)
-    can_emails = g.user.has("emails")
     return jsonify(stats={
         "documents": db.session.execute(select(func.count(Document.id)).where(active, visible)).scalar(),
         "folders": len(res.visible_folder_ids()),
-        "emails": db.session.execute(select(func.count(ArchivedEmail.id))).scalar() if can_emails else None,
+        # The user's own archived emails only.
+        "emails": email_svc.list_owned(g.user, limit=0)[1],
         "versions": db.session.execute(select(func.count(DocumentVersion.id))
                                        .join(Document, DocumentVersion.document_id == Document.id)
                                        .where(active, visible)).scalar(),
@@ -1594,8 +1643,7 @@ def change_password():
     if new_password != (data.get("new2") or ""):
         raise ValidationError("The new passwords do not match.")
     check_password_policy(new_password)
-    g.user.password_hash = hash_password(new_password)
-    log_activity("security", "password_changed", f"'{g.user.username}' changed their password", g.user.id)
+    sp.call("sp_user_set_password", g.user.id, hash_password(new_password), request.remote_addr)
     db.session.commit()
     return jsonify(ok=True)
 
@@ -2107,70 +2155,70 @@ def admin_status():
     )
 
 
+# Gmail: every signed-in user connects, syncs and disconnects their own mailbox.
+
 @bp.get("/gmail/status")
 @api_auth
 def gmail_status():
-    if not g.user.has("emails") and not g.user.has("admin"):
-        abort(403)
     from .gmail import _status_payload
-    return jsonify(status=_status_payload())
+    return jsonify(status=_status_payload(g.user))
 
 
 @bp.get("/gmail/connect")
 @api_auth
 def gmail_connect():
-    _admin_user()
     from ..gmail import auth as gmail_auth
+    from .gmail import begin_connect
     if not gmail_auth.credentials_configured():
         return jsonify(ok=False, error="Gmail OAuth client credentials are not configured.",
                        code="not_configured"), 409
-    callback = request.url_root.rstrip("/") + "/gmail/oauth2callback"
-    url, state, verifier = gmail_auth.start_authorization(callback)
-    session["oauth_state"], session["oauth_verifier"] = state, verifier
-    session["gmail_api_connect"] = True
-    return jsonify(authorization_url=url)
+    return jsonify(authorization_url=begin_connect(g.user))
 
 
 @bp.post("/gmail/disconnect")
 @api_auth
 def gmail_disconnect():
-    _admin_user()
-    from ..gmail import auth as gmail_auth
-    from ..gmail.sync import active_account
-    account = active_account()
-    gmail_auth.disconnect()
-    if account:
-        account.is_active = False
-        account.last_sync_status = "disconnected"
-        log_activity("gmail", "disconnected", f"Gmail account {account.email} disconnected")
-        db.session.commit()
-    return jsonify(ok=True)
+    from ..gmail.sync import disconnect_mailbox
+    return jsonify(ok=True, disconnected=disconnect_mailbox(g.user, request.remote_addr))
 
 
 @bp.post("/gmail/sync")
 @api_auth
 def gmail_sync():
-    if not g.user.has("emails") and not g.user.has("admin"):
-        abort(403)
-    from .. import ensure_scheduler
-    from ..gmail.sync import run_sync
-    scheduler = ensure_scheduler(current_app._get_current_object())
-    if scheduler is not None:
-        scheduler.trigger()
-        return jsonify(ok=True, status="started"), 202
-    result = run_sync(trigger="manual")
-    status = 200 if result.status in ("ok", "partial") else (409 if result.status == "busy" else 502)
-    return jsonify(ok=status == 200, result=result.as_dict()), status
+    from .gmail import sync_own
+    code, payload = sync_own(g.user)
+    return jsonify(**payload), code
 
 
 @bp.post("/gmail/retry")
 @api_auth
 def gmail_retry():
-    _admin_user()
+    """Re-queue the failed imports of the user's own mailbox (administrators: every mailbox)."""
     from .. import ensure_scheduler
     from ..gmail.sync import retry_failed
-    count = retry_failed()
+    count = retry_failed(None if g.user.has("admin") else g.user.id)
     scheduler = current_app.extensions.get("gmail_scheduler") or ensure_scheduler(current_app._get_current_object())
     if scheduler:
         scheduler.trigger()
     return jsonify(ok=True, queued=count), 202
+
+
+@bp.get("/admin/gmail/accounts")
+@api_auth
+def admin_gmail_accounts():
+    """Connected mailboxes and their sync health. Administrators never see email content here."""
+    _admin_user()
+    page = max(1, request.args.get("page", 1, type=int))
+    per_page = min(200, max(1, request.args.get("per_page", 50, type=int)))
+    rows = sp.call("sp_gmail_accounts_admin_list", per_page, (page - 1) * per_page, flush=False, expire=False)
+
+    def iso(value):
+        return value.isoformat() + "Z" if value else None
+
+    return jsonify(accounts=[{
+        "id": r["account_id"], "email": r["email"], "user_id": r["user_id"], "username": r["username"],
+        "connected": bool(r["is_active"]), "connected_at": iso(r["connected_at"]),
+        "last_sync_at": iso(r["last_sync_at"]), "last_success_at": iso(r["last_success_at"]),
+        "status": r["last_sync_status"], "error": r["last_error"], "archived_total": int(r["archived_total"]),
+        "pending": int(r["pending"]), "failed": int(r["failed"]),
+    } for r in rows], total=int(rows[0]["total"]) if rows else 0, page=page, per_page=per_page)

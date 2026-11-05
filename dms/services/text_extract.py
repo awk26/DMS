@@ -1,7 +1,15 @@
-"""Plain-text extraction for full-text search and version comparison."""
+"""Plain-text extraction for full-text search and version comparison.
+
+Images and scanned PDF pages are read with OCR when Tesseract is installed (TESSERACT_PATH or
+``tesseract`` on the PATH; DMS_OCR_ENABLED=false turns it off). Without Tesseract they are indexed
+by name and metadata only, as before.
+"""
 import io
+import itertools
 import logging
 import re
+import shutil
+import subprocess
 import zipfile
 
 from lxml import etree
@@ -12,7 +20,54 @@ TEXT_LIMIT = 2_000_000  # characters kept per item
 TEXT_EXTS = {"txt", "csv", "tsv", "md", "json", "xml", "log", "yaml", "yml", "ini", "html", "htm", "svg",
              "dxf", "step", "stp", "ifc", "iges", "igs"}
 EXTRACTABLE = TEXT_EXTS | {"pdf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "rtf", "eml", "vsdx"}
+# Searchable through OCR only (not text-comparable, so kept out of EXTRACTABLE).
+OCR_EXTS = {"png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp"}
 _WS = re.compile(r"[ \t\r\f\v]+")
+_SCANNED_PAGE_CHARS = 20  # a PDF page with less extractable text than this is treated as scanned
+
+
+# --------------------------------------------------------------------------- OCR (Tesseract)
+
+def _ocr_settings():
+    """(tesseract command, languages, max pages, timeout) or None when OCR is unavailable."""
+    try:
+        from flask import current_app
+        cfg = current_app.config
+    except RuntimeError:  # outside an application context
+        return None
+    if not cfg.get("OCR_ENABLED", True):
+        return None
+    cmd = cfg.get("TESSERACT_PATH") or shutil.which("tesseract")
+    if not cmd:
+        return None
+    return cmd, cfg.get("OCR_LANGUAGES") or "eng", cfg.get("OCR_MAX_PAGES", 20), cfg.get("OCR_TIMEOUT_SECONDS", 60)
+
+
+def ocr_available():
+    return _ocr_settings() is not None
+
+
+def _ocr_png(png, settings):
+    cmd, langs, _, timeout = settings
+    done = subprocess.run([cmd, "stdin", "stdout", "-l", langs], input=png, capture_output=True,
+                          timeout=timeout, check=False)
+    if done.returncode != 0:
+        log.info("Tesseract failed (%s): %s", done.returncode, done.stderr[:200])
+        return ""
+    return done.stdout.decode("utf-8", errors="replace")
+
+
+def _ocr_image(data, settings, max_frames=None):
+    """OCR every frame (multi-page TIFF/GIF) of an image, up to the page limit."""
+    from PIL import Image, ImageSequence
+    limit = max_frames or settings[2]
+    parts = []
+    with Image.open(io.BytesIO(data)) as img:
+        for frame in itertools.islice(ImageSequence.Iterator(img), limit):
+            buf = io.BytesIO()
+            frame.convert("RGB" if frame.mode not in ("L", "RGB") else frame.mode).save(buf, "PNG")
+            parts.append(_ocr_png(buf.getvalue(), settings))
+    return "\n".join(p for p in parts if p.strip())
 
 
 def _decode(data):
@@ -44,14 +99,24 @@ def _xml_text(data, para_tags=()):
 def _pdf(data):
     from pypdf import PdfReader
     reader = PdfReader(io.BytesIO(data))
+    ocr = _ocr_settings()
+    ocr_pages = 0
     parts = []
     for i, page in enumerate(reader.pages):
         if i >= 500:
             break
         try:
-            parts.append(page.extract_text() or "")
+            text = page.extract_text() or ""
         except Exception:
-            continue
+            text = ""
+        if ocr and len(text.strip()) < _SCANNED_PAGE_CHARS and ocr_pages < ocr[2]:
+            # Scanned page: OCR the page images it embeds.
+            ocr_pages += 1
+            try:
+                text += "\n" + "\n".join(_ocr_image(image.data, ocr, max_frames=1) for image in page.images)
+            except Exception:
+                log.info("OCR of PDF page %s failed", i + 1, exc_info=True)
+        parts.append(text)
     return "\n".join(parts)
 
 
@@ -140,6 +205,11 @@ def extract_bytes(data, ext):
             text = _rtf(data)
         elif ext == "eml":
             text = _eml(data)
+        elif ext in OCR_EXTS:
+            ocr = _ocr_settings()
+            if not ocr:
+                return ""
+            text = _ocr_image(data, ocr)
         else:
             return ""
     except Exception:
@@ -155,7 +225,7 @@ def extract_version(version, max_mb=50):
     if version is None or version.size > max_mb * 1024 * 1024:
         return ""
     ext = version.document.extension
-    if ext not in EXTRACTABLE:
+    if ext not in EXTRACTABLE and not (ext in OCR_EXTS and ocr_available()):
         return ""
     try:
         data = get_storage().read_bytes(version.storage_key)

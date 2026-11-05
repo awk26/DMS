@@ -1,81 +1,54 @@
-import io
-import re
-
+"""Cross-cutting security checks: response headers, error bodies and storage integrity."""
 import pytest
 
-from dms import create_app
-from dms.config import TestConfig
-
-from .conftest import PDF, upload
-
-PAGES = ["/", "/documents/", "/folders/", "/emails/", "/recent", "/versions", "/activity",
-         "/documents/trash", "/gmail/", "/does-not-exist"]
+from dms.storage import StorageError, get_storage
 
 
-def test_no_development_status_labels(client):
-    upload(client, "a.pdf", PDF)
-    banned = re.compile(r"\b(POC|proof of concept|demo|prototype)\b", re.IGNORECASE)
-    for url in PAGES + ["/documents/1"]:
-        text = client.get(url).data.decode()
-        visible = re.sub(r"<[^>]+>", " ", text)
-        assert not banned.search(visible), f"{url} contains a development-status label"
-
-
-def test_security_headers(client):
-    r = client.get("/")
+def test_security_headers(api):
+    r = api.get("/me")
     assert r.headers["X-Content-Type-Options"] == "nosniff"
     assert "script-src 'self'" in r.headers["Content-Security-Policy"]
     assert r.headers["X-Frame-Options"] == "SAMEORIGIN"
+    assert r.headers["Cache-Control"] == "no-store"
 
 
-@pytest.fixture
-def csrf_client(tmp_path):
-    app = create_app(TestConfig, WTF_CSRF_ENABLED=True,
-                     SQLALCHEMY_DATABASE_URI=f"sqlite:///{(tmp_path / 'c.sqlite').as_posix()}",
-                     STORAGE_DIR=tmp_path / "storage", INSTANCE_DIR=tmp_path)
-    with app.app_context():
-        from .conftest import login_as, make_user
-        yield login_as(app.test_client(), make_user("csrfadmin"))
-        from dms.extensions import db
-        db.session.remove()
-        db.engine.dispose()
-
-
-def test_csrf_required_for_state_changes(csrf_client):
-    r = csrf_client.post("/folders/", data={"name": "X"})
-    assert r.status_code == 400
-    r = csrf_client.post("/documents/upload", data={"file": (io.BytesIO(PDF), "a.pdf")},
-                         content_type="multipart/form-data")
-    assert r.status_code == 400
-    # With the token from a rendered page, the request succeeds.
-    page = csrf_client.get("/").data.decode()
-    token = re.search(r'name="csrf-token" content="([^"]+)"', page).group(1)
-    r = csrf_client.post("/folders/", data={"name": "X", "csrf_token": token})
-    assert r.status_code == 303
-
-
-def test_errors_do_not_leak_tracebacks(client, monkeypatch):
-    from dms.routes import main
-
+def test_errors_do_not_leak_tracebacks(api, monkeypatch):
     def broken():
         raise RuntimeError("secret internal detail")
 
-    monkeypatch.setitem(client.application.view_functions, "main.recent", broken)
-    r = client.get("/recent")
-    assert r.status_code == 500
+    monkeypatch.setitem(api.client.application.view_functions, "api.dashboard", broken)
+    r = api.get("/dashboard")
+    assert r.status_code == 500 and r.is_json
+    assert r.json["code"] == "internal_error"
     assert b"secret internal detail" not in r.data and b"Traceback" not in r.data
 
 
-def test_open_redirect_blocked(client):
-    r = client.post("/folders/", data={"name": "Y", "next": "https://evil.example.com/"})
-    assert r.status_code == 303 and "evil.example.com" not in r.headers["Location"]
-    r = client.post("/folders/", data={"name": "Z", "next": "//evil.example.com/"})
-    assert "evil.example.com" not in r.headers["Location"]
+def test_no_html_pages_are_served(app):
+    """The UI is the React app; the backend serves only /api/v1 and provider callbacks."""
+    client = app.test_client()
+    for url in ("/", "/documents/", "/folders/", "/emails/", "/shared", "/auth/login", "/static/css/app.css"):
+        r = client.get(url)
+        assert r.status_code == 404 and r.is_json, url
 
 
 def test_storage_rejects_traversal_keys(app):
-    from dms.storage import StorageError, get_storage
     storage = get_storage()
     for key in ("../credentials.json", "documents/../../x", "/etc/passwd", "documents\\..\\x", ""):
         with pytest.raises(StorageError):
             storage.local_path(key)
+
+
+def test_encrypted_storage_detects_tampering(app):
+    from dms.crypto import CHUNK_SIZE
+    storage = get_storage()
+    data = bytes(range(256)) * (CHUNK_SIZE // 128)  # two full chunks
+    storage.save_bytes("documents/t/t/x", data)
+    assert storage.read_bytes("documents/t/t/x") == data
+    path = storage.local_path("documents/t/t/x")
+    blob = bytearray(path.read_bytes())
+    blob[-5] ^= 1
+    path.write_bytes(bytes(blob))
+    with pytest.raises(Exception):
+        storage.read_bytes("documents/t/t/x")
+    storage.save_bytes("documents/t/t/empty", b"")
+    assert storage.read_bytes("documents/t/t/empty") == b""

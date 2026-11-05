@@ -1,5 +1,10 @@
 """Gmail -> DMS synchronisation.
 
+Every DMS user connects their own mailbox (``gmail_accounts.user_id``). Each sync run
+processes all connected mailboxes, GMAIL_SYNC_WORKERS at a time, each with its own
+credentials, history baseline and lease. Archived emails belong to the mailbox's user and
+are visible only to them.
+
 How "archived" is detected
 --------------------------
 Gmail does not notify external systems when the Archive button is clicked.
@@ -26,6 +31,7 @@ import base64
 import logging
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -33,11 +39,13 @@ from googleapiclient.errors import HttpError
 from sqlalchemy import select, update
 from flask import current_app
 
+from .. import sp
 from ..extensions import db
 from ..models import ArchivedEmail, GmailAccount, PendingImport, utcnow
 from ..services.activity import log_activity
 from ..services.emails import MESSAGE_ID_RE, store_email, update_state
-from .auth import GmailAuthError, build_service
+from .auth import GmailAuthError, build_service, check_domain, credentials_configured, mailbox_address, \
+    seal_credentials
 
 log = logging.getLogger(__name__)
 
@@ -126,27 +134,36 @@ def _release_lease(account_id):
 
 # ------------------------------------------------------------------- account
 
-def _get_or_create_account(email):
-    account = db.session.execute(select(GmailAccount).where(GmailAccount.email == email)).scalar_one_or_none()
-    if account is None:
-        account = GmailAccount(email=email)
-        db.session.add(account)
-        log_activity("gmail", "connected", f"Gmail account {email} connected")
-    account.is_active = True
-    # Only one mailbox is connected at a time (one token file).
-    db.session.execute(update(GmailAccount).where(GmailAccount.email != email).values(is_active=False))
+def account_for_user(user_id):
+    """The user's connected mailbox, or None."""
+    row = sp.call_one("sp_gmail_status_for_user", user_id, flush=False, expire=False)
+    if row is None or not row["is_active"]:
+        return None
+    return db.session.get(GmailAccount, row["account_id"])
+
+
+def connect_mailbox(user, creds, ip=None):
+    """Attach the mailbox behind ``creds`` to ``user`` and run its first sync. Returns a SyncResult.
+
+    Raises GmailAuthError (domain not allowed) or ValidationError (mailbox owned by another user).
+    """
+    email = mailbox_address(creds)
+    check_domain(email)
+    account_id = sp.call_one("sp_gmail_account_connect", user.id, email, seal_credentials(creds),
+                             user.label, ip)["account_id"]
     db.session.commit()
-    return account
+    return sync_account(account_id, trigger="connect")
 
 
-def active_account():
-    return db.session.execute(
-        select(GmailAccount).where(GmailAccount.is_active.is_(True)).order_by(GmailAccount.id.desc())
-    ).scalars().first()
+def disconnect_mailbox(user, ip=None):
+    """Stop archiving the user's mailbox and forget its token. Archived emails stay. Returns the count."""
+    count = sp.call_one("sp_gmail_account_disconnect", user.id, user.label, ip)["disconnected"]
+    db.session.commit()
+    return count
 
 
-def _mark_account(code, message):
-    account = active_account()
+def _mark_account(account_id, code, message):
+    account = db.session.get(GmailAccount, account_id)
     if account:
         account.last_sync_at = utcnow()
         account.last_sync_status = code
@@ -324,85 +341,53 @@ def import_message(service, account, message_id, source="manual"):
     return result
 
 
-def retry_failed(account_id=None):
-    q = update(PendingImport).where(PendingImport.status == "failed").values(status="pending", attempts=0)
-    if account_id:
-        q = q.where(PendingImport.account_id == account_id)
-    n = db.session.execute(q).rowcount
+def retry_failed(user_id=None):
+    """Re-queue failed imports of the user's mailbox (None = every mailbox). Returns the count."""
+    n = sp.call_one("sp_gmail_retry_failed", user_id)["requeued"]
     db.session.commit()
     return n
 
 
-# ------------------------------------------------------------------- legacy files
+# ------------------------------------------------------------------- entry points
 
-def import_legacy_files(account, service=None):
-    """One-time import of .eml files saved by the earlier version of this application.
-
-    The files are copied into storage (originals are left in place). When the
-    Gmail service is available, the thread id and current Gmail state are filled in.
-    """
-    folder = current_app.config["LEGACY_EMAIL_DIR"]
-    count = 0
-    if folder.is_dir():
-        for path in sorted(folder.glob("*.eml")):
-            mid = path.stem
-            if not MESSAGE_ID_RE.match(mid):
-                continue
-            try:
-                record, created = store_email(account, mid, path.read_bytes(), source="legacy", label_ids=None)
-                count += int(created)
-            except Exception:
-                db.session.rollback()
-                log.exception("Legacy import failed for %s", path.name)
-                continue
-            if created and service is not None:
-                try:
-                    msg = _execute(service.users().messages().get(userId="me", id=mid, format="minimal"))
-                    record.gmail_thread_id = msg.get("threadId")
-                    update_state(record, msg.get("labelIds", []))
-                except HttpError as exc:
-                    if _status(exc) == 404:
-                        update_state(record, deleted=True)
-                except Exception:
-                    log.warning("Could not look up Gmail state for legacy message %s", mid)
-                db.session.commit()
-    account.legacy_imported = True
-    db.session.commit()
-    return count
-
-
-# ------------------------------------------------------------------- entry point
-
-def run_sync(service=None, trigger="scheduled"):
+def sync_account(account_id, service=None, trigger="scheduled"):
+    """Synchronise one connected mailbox. Returns a SyncResult."""
     result = SyncResult()
+    account = db.session.get(GmailAccount, account_id)
+    if account is None or not account.is_active or account.user_id is None:
+        result.status, result.message = "not_connected", "Gmail is not connected."
+        return result
+    result.account = account.email
     try:
-        service = service or build_service()
+        service = service or build_service(account)
+        db.session.commit()  # keeps a token refreshed while building the service
         profile = _execute(service.users().getProfile(userId="me"))
     except GmailAuthError as exc:
+        db.session.rollback()
         result.status, result.message = exc.code, str(exc)
         if exc.code != "not_connected" and exc.code != "not_configured":
-            _mark_account(exc.code, str(exc))
+            _mark_account(account_id, exc.code, str(exc))
         return result
     except HttpError as exc:
         code = "reauth_required" if _is_auth_error(exc) else "error"
         result.status, result.message = code, _short_error(exc)
-        _mark_account(code, result.message)
+        _mark_account(account_id, code, result.message)
         return result
     except Exception as exc:  # network failures etc.
         result.status, result.message = "error", _short_error(exc)
-        _mark_account("error", result.message)
+        _mark_account(account_id, "error", result.message)
         return result
 
-    account = _get_or_create_account(profile["emailAddress"])
-    result.account = account.email
+    if profile["emailAddress"].lower() != account.email.lower():
+        result.status = "reauth_required"
+        result.message = f"The stored authorization belongs to {profile['emailAddress']}, not {account.email}."
+        _mark_account(account_id, result.status, result.message)
+        return result
     if not _acquire_lease(account.id):
         result.status, result.message = "busy", "A synchronization is already running."
         return result
 
     try:
-        if not account.legacy_imported:
-            import_legacy_files(account, service)
-
         if not account.history_id:
             result.mode = "initial"
             account.history_id = str(profile["historyId"])
@@ -447,24 +432,61 @@ def run_sync(service=None, trigger="scheduled"):
                           f"{result.failed} failed")
         if result.failed:
             result.status = "partial"
-        log.info("Gmail sync (%s, %s): %s", trigger, result.mode, result.message)
+        log.info("Gmail sync %s (%s, %s): %s", account_id, trigger, result.mode, result.message)
     except GmailAuthError as exc:
         db.session.rollback()
         result.status, result.message = exc.code, str(exc)
-        _mark_account(exc.code, str(exc))
+        _mark_account(account_id, exc.code, str(exc))
     except HttpError as exc:
         db.session.rollback()
         code = "reauth_required" if _is_auth_error(exc) else "error"
         result.status, result.message = code, _short_error(exc)
-        _mark_account(code, result.message)
+        _mark_account(account_id, code, result.message)
     except Exception as exc:  # noqa: BLE001
         db.session.rollback()
-        log.exception("Gmail sync failed")
+        log.exception("Gmail sync of account %s failed", account_id)
         result.status, result.message = "error", _short_error(exc)
-        _mark_account("error", result.message)
+        _mark_account(account_id, "error", result.message)
     finally:
         try:
-            _release_lease(account.id)
+            _release_lease(account_id)
         except Exception:
             db.session.rollback()
     return result
+
+
+def sync_all(trigger="scheduled"):
+    """Synchronise every connected mailbox, GMAIL_SYNC_WORKERS at a time. Returns a summary dict."""
+    if not credentials_configured():
+        return {"status": "not_configured", "message": "OAuth client file (credentials.json) is missing.",
+                "accounts": 0}
+    ids = [row["id"] for row in sp.call("sp_gmail_accounts_due", 1000000, flush=False, expire=False)]
+    db.session.commit()
+    app = current_app._get_current_object()
+
+    def one(account_id):
+        # Each worker thread gets its own app context and therefore its own database session.
+        with app.app_context():
+            try:
+                return sync_account(account_id, trigger=trigger)
+            except Exception as exc:  # noqa: BLE001 - one mailbox must not stop the others
+                log.exception("Gmail sync of account %s failed", account_id)
+                return SyncResult(status="error", message=_short_error(exc))
+            finally:
+                db.session.remove()
+
+    results = []
+    if ids:
+        with ThreadPoolExecutor(max_workers=min(app.config["GMAIL_SYNC_WORKERS"], len(ids)),
+                                thread_name_prefix="gmail-sync") as pool:
+            results = list(pool.map(one, ids))
+    problems = [r for r in results if r.status not in ("ok", "busy")]
+    return {
+        "status": "partial" if problems else "ok",
+        "message": f"{len(results)} mailbox(es) synchronised, {len(problems)} with problems",
+        "accounts": len(results),
+        "imported": sum(r.imported for r in results),
+        "state_changes": sum(r.state_changes for r in results),
+        "failed": sum(r.failed for r in results),
+        "errors": [f"{r.account}: {r.status} {r.message}"[:300] for r in problems][:20],
+    }

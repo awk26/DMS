@@ -1,53 +1,29 @@
-"""Document Management System with Gmail archiving."""
-import json
+"""Document Management System with Gmail archiving: a JSON API (``/api/v1``) for the React frontend."""
 import logging
 import threading
-from datetime import timedelta, timezone
+from datetime import timedelta
 
-from dotenv import load_dotenv
-from flask import Flask, g, jsonify, render_template, request
+from flask import Flask, jsonify, request
 from flask_wtf.csrf import CSRFError
-from sqlalchemy import event
-from sqlalchemy.engine import Engine
 from werkzeug.exceptions import HTTPException
 
-from .config import BASE_DIR, Config
+from .config import Config
 from .extensions import csrf, db
 from .storage import LocalStorage
-
-load_dotenv(BASE_DIR / ".env")
+from .validation import ValidationError
 
 _scheduler_lock = threading.Lock()
 
 
-@event.listens_for(Engine, "connect")
-def _sqlite_pragmas(dbapi_conn, _record):
-    if dbapi_conn.__class__.__module__.startswith("sqlite3"):
-        cur = dbapi_conn.cursor()
-        cur.execute("PRAGMA foreign_keys=ON")
-        cur.execute("PRAGMA journal_mode=WAL")
-        cur.execute("PRAGMA busy_timeout=15000")
-        cur.close()
-
-
-def wants_json():
-    if request.headers.get("X-Requested-With") == "fetch":
-        return True
-    best = request.accept_mimetypes.best_match(["application/json", "text/html"])
-    return best == "application/json" and request.accept_mimetypes[best] > request.accept_mimetypes["text/html"]
-
-
 def create_app(config_object=None, **overrides):
     configured_app = config_object or Config
-    legacy_ui_enabled = overrides.get(
-        "LEGACY_UI_ENABLED", getattr(configured_app, "LEGACY_UI_ENABLED", False)
-    )
+    # API only: no server-rendered pages, templates or static files (the UI is the React app in DMS-FE).
     app = Flask(
         __name__,
         instance_path=str(Config.INSTANCE_DIR),
         instance_relative_config=False,
-        static_folder="static" if legacy_ui_enabled else None,
-        template_folder="templates" if legacy_ui_enabled else None,
+        static_folder=None,
+        template_folder=None,
     )
     app.config.from_object(configured_app)
     app.config.update(overrides)
@@ -64,6 +40,9 @@ def create_app(config_object=None, **overrides):
         if parsed_frontend.scheme not in ("http", "https") or not parsed_frontend.netloc \
                 or parsed_frontend.username or parsed_frontend.password or parsed_frontend.fragment:
             raise ValueError("DMS_ANGULAR_FRONTEND_URL must be an absolute http(s) URL without credentials or fragment.")
+    # MySQL is the only supported database: data access goes through its stored procedures (dms/sp.py).
+    if not str(app.config.get("SQLALCHEMY_DATABASE_URI") or "").startswith("mysql"):
+        raise RuntimeError("DATABASE_URL must point to MySQL (mysql+pymysql://...). Check the .env file.")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
@@ -97,11 +76,6 @@ def create_app(config_object=None, **overrides):
     app.register_blueprint(api.bp)
     app.register_blueprint(auth.callback_bp)
     app.register_blueprint(gmail.callback_bp)
-    if app.config.get("LEGACY_UI_ENABLED"):
-        from .routes import access, account, admin, documents, emails, folders, main, search
-        for bp in (main.bp, documents.bp, folders.bp, emails.bp, gmail.bp, auth.bp, account.bp, admin.bp,
-                   search.bp, access.bp):
-            app.register_blueprint(bp)
     csrf.exempt(api.bp)
 
     from .cli import register_cli
@@ -111,8 +85,6 @@ def create_app(config_object=None, **overrides):
     app.before_request(auth_security.enforce_request_security)
     app.after_request(auth_security.after_request)
 
-    if app.config.get("LEGACY_UI_ENABLED"):
-        _register_template_helpers(app)
     _register_error_handlers(app)
     _register_security_headers(app)
     _register_api_cors(app)
@@ -153,132 +125,45 @@ def ensure_maintenance(app):
     return sched
 
 
-def _register_template_helpers(app):
-    from .validation import TYPE_LABELS
-
-    @app.template_filter("filesize")
-    def filesize(n):
-        n = float(n or 0)
-        for unit in ("B", "KB", "MB", "GB"):
-            if n < 1024 or unit == "GB":
-                return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-            n /= 1024
-
-    @app.template_filter("dt")
-    def format_dt(value, fmt="%d %b %Y, %H:%M"):
-        if not value:
-            return "—"
-        return value.replace(tzinfo=timezone.utc).astimezone().strftime(fmt)
-
-    @app.template_filter("importable")
-    def importable(filename):
-        from .validation import extension_of, is_allowed_extension
-        return is_allowed_extension(extension_of(filename))
-
-    @app.template_filter("typelabel")
-    def typelabel(ext):
-        return TYPE_LABELS.get((ext or "").lower(), (ext or "File").upper())
-
-    @app.context_processor
-    def inject_globals():
-        from .gmail.sync import active_account
-        from .security.permissions import resolver
-        user = getattr(g, "user", None)
-        try:
-            account = active_account() if user is not None and user.has("emails") else None
-        except Exception:
-            account = None
-
-        def folder_options_json(perm="edit"):
-            from .services.folders import folder_tree
-            if user is None:
-                return "[]"
-            res = resolver()
-            visible = None if res.is_admin else res.visible_folder_ids()
-            data = [{"id": f.id, "parent": f.parent_id, "name": f.name, "depth": d, "path": f.path,
-                     "can": perm in res.folder(f)}
-                    for f, d in folder_tree(visible)]
-            return json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-
-        def can(perm, obj=None):
-            return user is not None and resolver().can(perm, obj)
-
-        def has_cap(cap):
-            return user is not None and user.has(cap)
-
-        def is_fav(kind, target_id):
-            if user is None:
-                return False
-            if "dms_favs" not in g:
-                from .models import Favourite
-                from sqlalchemy import select
-                g.dms_favs = set(db.session.execute(select(Favourite.target_type, Favourite.target_id)
-                                                    .where(Favourite.user_id == user.id)).all())
-            return (kind, target_id) in g.dms_favs
-
-        def folder_label(folder):
-            return "My Files" if user is not None and folder is not None and folder.id == user.home_folder_id                 else folder.name
-
-        def crumbs(folder):
-            """[(folder, label, can_view)] from the top down to ``folder``; inside My Files it starts there."""
-            if folder is None:
-                return []
-            chain = folder.ancestors() + [folder]
-            home = user.home_folder_id if user is not None else None
-            ids = [f.id for f in chain]
-            if home in ids:
-                chain = chain[ids.index(home):]
-            res = resolver()
-            return [(f, folder_label(f), "view" in res.folder(f)) for f in chain]
-
-        return {"app_name": app.config["APP_NAME"], "gmail_account": account, "current_user": user,
-                "max_upload_mb": _max_upload_mb(), "folder_options_json": folder_options_json,
-                "can": can, "has_cap": has_cap, "is_fav": is_fav, "folder_label": folder_label, "crumbs": crumbs,
-                "home_folder_id": user.home_folder_id if user is not None else None,
-                "root_can_edit": user is not None and resolver().can("edit", None)}
-
-    def _max_upload_mb():
-        from .services import settings
-        try:
-            return settings.get("max_upload_mb")
-        except Exception:
-            return app.config["MAX_UPLOAD_MB"]
+_ERROR_CODES = {
+    400: "bad_request",
+    401: "authentication_required",
+    403: "forbidden",
+    404: "not_found",
+    409: "conflict",
+    413: "payload_too_large",
+}
 
 
 def _register_error_handlers(app):
-    def render_error(status, title, message):
-        if not app.config.get("LEGACY_UI_ENABLED") or wants_json() or request.path.startswith("/api/"):
-            code = {
-                400: "bad_request",
-                401: "authentication_required",
-                403: "forbidden",
-                404: "not_found",
-                409: "conflict",
-                413: "payload_too_large",
-            }.get(status, "internal_error" if status >= 500 else "request_failed")
-            return jsonify(ok=False, error=message, code=code), status
-        return render_template("error.html", status=status, title=title, message=message), status
+    """Every error is a JSON body: {"ok": false, "error": <message>, "code": <code>}."""
+    def json_error(status, message):
+        code = _ERROR_CODES.get(status, "internal_error" if status >= 500 else "request_failed")
+        return jsonify(ok=False, error=message, code=code), status
 
     @app.errorhandler(CSRFError)
     def csrf_error(e):
-        return render_error(400, "Session expired", "Your session token is missing or expired. "
-                                                    "Reload the page and try again.")
+        return json_error(400, "Your session token is missing or expired. Reload the page and try again.")
 
     @app.errorhandler(413)
     def too_large(e):
-        return render_error(413, "File too large",
-                            f"The upload exceeds the {app.config['MAX_REQUEST_MB']} MB limit.")
+        return json_error(413, f"The upload exceeds the {app.config['MAX_REQUEST_MB']} MB limit.")
 
     @app.errorhandler(HTTPException)
     def http_error(e):
-        return render_error(e.code, e.name, e.description if e.code != 500 else "An unexpected error occurred.")
+        return json_error(e.code, e.description if e.code != 500 else "An unexpected error occurred.")
+
+    @app.errorhandler(ValidationError)
+    def validation_error(e):
+        # Routes outside the API decorator (e.g. provider callbacks) would otherwise surface these as 500s.
+        db.session.rollback()
+        return jsonify(ok=False, error=str(e), code="validation_error"), 400
 
     @app.errorhandler(Exception)
     def unhandled(e):
         app.logger.exception("Unhandled error on %s %s", request.method, request.path)
         db.session.rollback()
-        return render_error(500, "Something went wrong",
-                            "An unexpected error occurred. The problem has been logged.")
+        return json_error(500, "An unexpected error occurred. The problem has been logged.")
 
 
 def _register_security_headers(app):
@@ -292,7 +177,7 @@ def _register_security_headers(app):
         resp.headers.setdefault("Referrer-Policy", "same-origin")
         resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
         resp.headers.setdefault("Content-Security-Policy", default_csp)
-        if request.endpoint and not request.endpoint.startswith("static"):
+        if request.endpoint:
             resp.headers.setdefault("Cache-Control", "no-store")
         return resp
 

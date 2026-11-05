@@ -1,8 +1,8 @@
 """Lightweight schema upgrades for existing databases.
 
 ``db.create_all()`` creates new tables but never changes existing ones. This adds any
-missing columns (all new columns are nullable or have a server default), creates the
-full-text index, seeds the predefined roles and back-fills derived data.
+missing columns (all new columns are nullable or have a server default), seeds the
+predefined roles and back-fills derived data.
 """
 import logging
 
@@ -17,6 +17,7 @@ def _add_missing_columns():
     engine = db.engine
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
+    quote = engine.dialect.identifier_preparer.quote  # `name` on MySQL
     added = []
     with engine.begin() as conn:
         for table in db.Model.metadata.sorted_tables:
@@ -32,7 +33,7 @@ def _add_missing_columns():
                     arg = col.server_default.arg
                     arg = arg if isinstance(arg, str) else arg.text
                     default = f" DEFAULT {arg}" if arg.isdigit() else f" DEFAULT '{arg}'"
-                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {ddl_type}{default}'))
+                conn.execute(text(f"ALTER TABLE {quote(table.name)} ADD COLUMN {quote(col.name)} {ddl_type}{default}"))
                 added.append(f"{table.name}.{col.name}")
     if added:
         log.info("Database upgraded: added columns %s", ", ".join(added))
@@ -49,7 +50,6 @@ def upgrade(app):
     from .services import search
     _add_missing_columns()
     _backfill()
-    search.setup_fts()
     ensure_predefined_roles()
     # Index existing content the first time search is available.
     from .models import ArchivedEmail, Document, SearchEntry

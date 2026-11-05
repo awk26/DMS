@@ -1,7 +1,6 @@
-"""BRD Phase 1 acceptance tests against the REST API only (/api/v1, legacy UI disabled).
+"""BRD Phase 1 acceptance tests against the REST API (/api/v1) that the React frontend uses.
 
-The other BRD tests exercise the legacy HTML routes; these prove the same requirements through
-the API that the Angular client, desktop sync client and mobile app actually use.
+The ``app``, ``admin`` and ``api`` fixtures and the ``Api`` client come from conftest.py.
 """
 import io
 import time
@@ -9,14 +8,12 @@ import zipfile
 
 import pytest
 
-from dms import create_app
-from dms.config import TestConfig
 from dms.extensions import db
 from dms.models import Document, Role, User
 from dms.services import settings
 from dms.storage import get_storage
 
-from .conftest import PDF, PNG, make_user
+from .conftest import PDF, PNG, Api, make_user
 
 EICAR = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 
@@ -29,82 +26,6 @@ def docx(text="Hello"):
                     '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
                     f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>")
     return buf.getvalue()
-
-
-@pytest.fixture
-def app(tmp_path):
-    app = create_app(
-        TestConfig,
-        SQLALCHEMY_DATABASE_URI=f"sqlite:///{(tmp_path / 'api.sqlite').as_posix()}",
-        INSTANCE_DIR=tmp_path, STORAGE_DIR=tmp_path / "storage",
-        LEGACY_EMAIL_DIR=tmp_path / "legacy_emails",
-        GMAIL_TOKEN_FILE=tmp_path / "token.json", GMAIL_CREDENTIALS_FILE=tmp_path / "credentials.json",
-        MAX_CONTENT_LENGTH=2 * 1024 * 1024, LEGACY_UI_ENABLED=False,
-    )
-    with app.app_context():
-        yield app
-        db.session.remove()
-        db.engine.dispose()
-
-
-class Api:
-    """Test client bound to one user's personal access token."""
-
-    def __init__(self, app, user):
-        from dms.security.auth import new_api_token
-        self.user = user
-        raw, _ = new_api_token(user, "tests")
-        self.client = app.test_client()
-        self.headers = {"Authorization": f"Bearer {raw}"}
-
-    def _call(self, method, url, **kw):
-        headers = {**self.headers, **kw.pop("headers", {})}
-        return getattr(self.client, method)("/api/v1" + url, headers=headers, **kw)
-
-    def get(self, url, **kw):
-        return self._call("get", url, **kw)
-
-    def post(self, url, json=None, **kw):
-        return self._call("post", url, json=json, **kw) if json is not None else self._call("post", url, **kw)
-
-    def patch(self, url, json=None, **kw):
-        return self._call("patch", url, json=json or {}, **kw)
-
-    def put(self, url, json=None, **kw):
-        return self._call("put", url, json=json or {}, **kw)
-
-    def delete(self, url, json=None, **kw):
-        return self._call("delete", url, json=json, **kw) if json is not None else self._call("delete", url, **kw)
-
-    def folder(self, name, parent=None):
-        r = self.post("/folders", json={"name": name, "parent_id": parent})
-        assert r.status_code == 201, r.json
-        return r.json["folder"]["id"]
-
-    def upload(self, name, data, folder_id=None, **fields):
-        form = {"file": (io.BytesIO(data), name), **{k: str(v) for k, v in fields.items()}}
-        if folder_id:
-            form["folder_id"] = str(folder_id)
-        return self.post("/documents", data=form, content_type="multipart/form-data")
-
-    def doc(self, name, data, folder_id=None, **fields):
-        r = self.upload(name, data, folder_id, **fields)
-        assert r.status_code == 201, r.json
-        return r.json["document"]["id"]
-
-    def version(self, doc_id, name, data, **fields):
-        form = {"file": (io.BytesIO(data), name), **{k: str(v) for k, v in fields.items()}}
-        return self.post(f"/documents/{doc_id}/versions", data=form, content_type="multipart/form-data")
-
-
-@pytest.fixture
-def admin(app):
-    return make_user("admin", ("Admin",), email="admin@example.com", display_name="Admin User")
-
-
-@pytest.fixture
-def api(app, admin):
-    return Api(app, admin)
 
 
 @pytest.fixture

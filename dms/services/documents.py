@@ -1,15 +1,28 @@
-"""Document and version operations."""
+"""Document and version operations.
+
+Concurrent uploads are protected by:
+* one database transaction per upload (document + version + search entry commit together; on any
+  failure everything rolls back and the stored file is deleted);
+* a MySQL named lock per (folder, name) for uploads, so a name is created only once;
+* a row lock (SELECT ... FOR UPDATE) on the document while a version is added, so versions are
+  numbered and checked (duplicate content, check-out) one at a time;
+* optimistic locking: ``base_version`` on uploads (409 if the document moved on) and the
+  ``documents.row_version`` counter for every other document update;
+* unique (document_id, version_number) and idempotency keys as the last line of defence.
+"""
+import hashlib
 import logging
 import re
+from contextlib import contextmanager
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
 from ..extensions import db
 from ..models import Document, DocumentLink, DocumentVersion, RecentItem, utcnow
 from ..security.malware import scan_stream
 from ..storage import get_storage
-from ..validation import ValidationError, extension_of, validate_name, validate_upload
+from ..validation import ConflictError, ValidationError, extension_of, validate_name, validate_upload
 from . import search, settings
 from .activity import log_activity, log_folder
 from .folders import NotFound
@@ -37,12 +50,21 @@ def _clean_key(key):
     return key if _IDEMPOTENCY_RE.match(key) else None
 
 
+def _same_name_query(name, folder_id):
+    q = select(Document).where(func.lower(Document.name) == name.lower(), Document.deleted_at.is_(None))
+    return q.where(Document.folder_id.is_(None) if folder_id is None else Document.folder_id == folder_id)
+
+
 def _name_taken(name, folder_id, exclude_id=None):
-    q = select(Document.id).where(func.lower(Document.name) == name.lower(), Document.deleted_at.is_(None))
-    q = q.where(Document.folder_id.is_(None) if folder_id is None else Document.folder_id == folder_id)
+    q = _same_name_query(name, folder_id)
     if exclude_id:
         q = q.where(Document.id != exclude_id)
-    return db.session.execute(q).first() is not None
+    return db.session.execute(q.with_only_columns(Document.id)).first() is not None
+
+
+def find_by_name(name, folder_id):
+    """The live document called ``name`` (case-insensitive) in the folder, or None."""
+    return db.session.execute(_same_name_query(name, folder_id).limit(1)).scalar_one_or_none()
 
 
 def _unique_name(name, folder_id):
@@ -93,18 +115,43 @@ def _uid(user):
 
 def upload_document(file_storage, folder=None, idempotency_key=None, note=None, user=None,
                     document_type=None, metadata=None, tags=None):
-    """Create a new document (version 1.0). Returns (document, created)."""
+    """Upload a file into ``folder``. Returns (document, created, new_version).
+
+    * No document of that name in the folder: a new document, version 1.0
+      (created=True, new_version=None).
+    * A document of that name already exists: the file becomes its next minor version
+      (1.0 -> 1.1 -> 1.2 ...), keeping every earlier version (created=False, new_version=the version).
+      Identical content (same SHA-256 as the current version) is refused, so is a document the
+      uploader may not edit or that someone else has checked out.
+    * A retried request (same idempotency key): the earlier result (created=False, new_version=None).
+    """
     key = _clean_key(idempotency_key)
     existing = _existing_for_key(key)
     if existing:
-        return existing.document, False
+        return existing.document, False, None
 
     display_name, ext, mime = validate_upload(file_storage)
+    # Naming convention (length, configured pattern) applies to uploads too, and a folder never
+    # holds two documents with the same name (FR-FLD-03): a changed file is a new version instead.
+    validate_name(display_name, "document")
+    folder_id = folder.id if folder else None
+    # Concurrent uploads of the same name into the same folder run one at a time, so two people
+    # can never both create "report.txt" there; the second one becomes version 1.1 instead.
+    with _name_lock(folder_id, display_name):
+        _fresh_snapshot()  # see documents other uploads committed while we waited for the lock
+        same_name = find_by_name(display_name, folder_id)
+        if same_name is not None:
+            return same_name, False, _version_same_name(same_name, file_storage, key, note, user)
+        return _create_document(file_storage, folder, display_name, ext, mime, key, note, user,
+                                document_type, metadata, tags)
+
+
+def _create_document(file_storage, folder, display_name, ext, mime, key, note, user, document_type, metadata, tags):
+    """Store ``file_storage`` as a new document, version 1.0. Returns (document, True, None)."""
     scan = _scan(file_storage, display_name)
     storage_key, size, sha = _store(file_storage.stream)
     try:
-        folder_id = folder.id if folder else None
-        doc = Document(name=_unique_name(display_name, folder_id), extension=ext, folder=folder,
+        doc = Document(name=display_name, extension=ext, folder=folder,
                        created_by_id=_uid(user), document_type=document_type)
         db.session.add(doc)
         db.session.flush()
@@ -133,13 +180,79 @@ def upload_document(file_storage, folder=None, idempotency_key=None, note=None, 
         get_storage().delete(storage_key)
         existing = _existing_for_key(key)
         if existing:  # concurrent retry won the race
-            return existing.document, False
+            return existing.document, False, None
         raise
     except Exception:
         db.session.rollback()
         get_storage().delete(storage_key)
         raise
-    return doc, True
+    return doc, True, None
+
+
+@contextmanager
+def _name_lock(folder_id, name, timeout=30):
+    """Hold a MySQL named lock on (folder, lower-case name) for the duration of the block.
+
+    It lives on its own connection so committing the ORM session (which returns the session's
+    connection to the pool) never releases or leaks it. MySQL also frees it if the process dies.
+    """
+    digest = hashlib.sha1(f"{folder_id or 0}/{name.lower()}".encode("utf-8")).hexdigest()
+    lock_name = f"dms-docname-{digest}"  # MySQL lock names are limited to 64 characters
+    conn = db.engine.connect()
+    try:
+        got = conn.execute(text("SELECT GET_LOCK(:n, :t)"), {"n": lock_name, "t": timeout}).scalar()
+        if got != 1:
+            raise ConflictError(f"'{name}' is being uploaded by someone else right now. Try again in a moment.")
+        try:
+            yield
+        finally:
+            conn.execute(text("SELECT RELEASE_LOCK(:n)"), {"n": lock_name})
+    finally:
+        conn.close()
+
+
+def _fresh_snapshot():
+    """End the session's transaction so the next reads see everything committed up to now.
+
+    MySQL (REPEATABLE READ) keeps a transaction's first read snapshot; without this, a check made
+    after waiting for a lock could still read data from before another request committed.
+    Nothing is pending at the call sites, so this only ends the read snapshot.
+    """
+    db.session.commit()
+
+
+def _lock_document(doc):
+    """Lock ``doc``'s row (SELECT ... FOR UPDATE) until the transaction ends and reload it.
+
+    Version uploads, check-ins and restores of one document then run one after another, and the
+    checks made after this call (checked out?, base version, duplicate content, next number)
+    see the latest committed state.
+    """
+    _fresh_snapshot()
+    db.session.refresh(doc, with_for_update=True)
+
+
+def _check_base_version(doc, base_version):
+    """Optimistic locking for uploads: refuse if the document moved on from the version the client started from."""
+    if base_version is None:
+        return
+    current = doc.current_version
+    if current is not None and current.version_number != base_version:
+        raise ConflictError(
+            f"'{doc.name}' was changed while you were working on it: the current version is now {current.label}"
+            f"{' (uploaded by ' + current.created_by.label + ')' if current.created_by else ''}. "
+            "Review the latest version, then upload your file again.",
+            current_version=current.label, current_version_number=current.version_number)
+
+
+def _version_same_name(doc, file_storage, key, note, user):
+    """Add an uploaded file as the next version of the same-named document ``doc``."""
+    from ..security.permissions import Resolver
+    if not Resolver(user).can("edit", doc):
+        raise ValidationError(f"A document named '{doc.name}' already exists in this folder and you do not "
+                              "have permission to add versions to it. Rename the file to upload it separately.")
+    version, _ = add_version(doc, file_storage, key, note, user=user)  # refuses content already stored
+    return version
 
 
 # --------------------------------------------------------------------------- check-out / locking
@@ -177,13 +290,14 @@ def release(doc, user, force=False):
     return doc
 
 
-def checkin(doc, user, file_storage=None, note=None, major=False, idempotency_key=None):
+def checkin(doc, user, file_storage=None, note=None, major=False, idempotency_key=None, base_version=None):
     """Check in: optionally upload the new content, then release the lock."""
     if doc.checked_out_by_id != user.id:
         raise ValidationError("You do not have this document checked out.")
     version = None
     if file_storage is not None and file_storage.filename:
-        version, _ = add_version(doc, file_storage, idempotency_key, note, user=user, major=major)
+        version, _ = add_version(doc, file_storage, idempotency_key, note, user=user, major=major,
+                                 base_version=base_version)
     doc.checked_out_by_id = None
     doc.checked_out_at = None
     log_activity("document", "checked_in", f"Checked in '{doc.name}'" + (f" as {version.label}" if version else ""),
@@ -248,15 +362,31 @@ def _append_version(doc, storage_key, size, sha, mime, original_filename, note, 
         raise
 
 
-def add_version(doc, file_storage, idempotency_key=None, note=None, user=None, major=False):
-    """Upload new content for ``doc``. Returns (version, created)."""
+def _version_conflict(doc, key, exc):
+    """A version insert failed on a unique constraint: a retried request, or (should not happen
+    under the row lock) a numbering clash. Returns the earlier result or raises ConflictError."""
+    existing = _existing_for_key(key)
+    if existing:
+        return existing
+    log.warning("Version insert conflict on document %s: %s", doc.id, exc)
+    raise ConflictError(f"'{doc.name}' was updated by someone else at the same time. Try again.") from None
+
+
+def add_version(doc, file_storage, idempotency_key=None, note=None, user=None, major=False, base_version=None):
+    """Upload new content for ``doc``. Returns (version, created).
+
+    ``base_version`` (optional) is the version number the uploader started from; if the document
+    has moved on since, ConflictError (HTTP 409) is raised instead of silently stacking on top.
+    """
     key = _clean_key(idempotency_key)
     existing = _existing_for_key(key)
     if existing:
         if existing.document_id != doc.id:
             raise ValidationError("Duplicate request token.")
         return existing, False
+    # Fail fast before scanning/storing; everything is checked again under the row lock below.
     ensure_unlocked(doc, user)
+    _check_base_version(doc, base_version)
     _check_comment(note, major)
     display_name, ext, mime = validate_upload(file_storage)
     if ext != doc.extension:
@@ -264,22 +394,41 @@ def add_version(doc, file_storage, idempotency_key=None, note=None, user=None, m
     scan = _scan(file_storage, display_name)
     storage_key, size, sha = _store(file_storage.stream)
     try:
-        return _append_version(doc, storage_key, size, sha, mime, display_name, note, key, user, major,
-                               scan_engine=scan.engine), True
-    except IntegrityError:
-        existing = _existing_for_key(key)
-        if existing:
-            return existing, False
+        _lock_document(doc)
+        ensure_unlocked(doc, user)
+        _check_base_version(doc, base_version)
+        # Same content as any stored version (SHA-256) is not saved again. Bringing back old content
+        # is what "Restore this version" is for (restore_version does not go through this check).
+        same = db.session.execute(select(DocumentVersion).where(
+            DocumentVersion.document_id == doc.id, DocumentVersion.sha256 == sha
+        ).order_by(DocumentVersion.version_number.desc()).limit(1)).scalar_one_or_none()
+        if same is not None:
+            if same.id == doc.current_version_id:
+                raise ValidationError(f"'{doc.name}' was not changed: the file is identical to the current version "
+                                      f"({same.label}), so no new version was created.")
+            raise ValidationError(f"'{doc.name}' was not uploaded: the file is identical to version {same.label}. "
+                                  "To make that content current again, use Restore on version "
+                                  f"{same.label} in the version history.")
+    except Exception:
+        db.session.rollback()  # releases the row lock
+        get_storage().delete(storage_key)
         raise
+    try:
+        return _append_version(doc, storage_key, size, sha, mime, display_name, note, key, user, major,
+                               scan_engine=scan.engine), True  # commits, which releases the row lock
+    except IntegrityError as exc:
+        return _version_conflict(doc, key, exc), False
 
 
-def restore_version(doc, version_number, idempotency_key=None, user=None, major=False, note=None):
+def restore_version(doc, version_number, idempotency_key=None, user=None, major=False, note=None,
+                    base_version=None):
     """Make an old version current by creating a new version with its content (history is kept)."""
     key = _clean_key(idempotency_key)
     existing = _existing_for_key(key)
     if existing:
         return existing, False
     ensure_unlocked(doc, user)
+    _check_base_version(doc, base_version)
     source = get_version(doc, version_number)
     if doc.current_version_id == source.id:
         raise ValidationError(f"Version {source.label} is already the current version.")
@@ -290,14 +439,21 @@ def restore_version(doc, version_number, idempotency_key=None, user=None, major=
     with storage.open(source.storage_key) as fh:
         storage_key, size, sha = _store(fh)
     try:
+        _lock_document(doc)
+        ensure_unlocked(doc, user)
+        _check_base_version(doc, base_version)
+        if doc.current_version_id == source.id:
+            raise ValidationError(f"Version {source.label} is already the current version.")
+    except Exception:
+        db.session.rollback()
+        get_storage().delete(storage_key)
+        raise
+    try:
         version = _append_version(doc, storage_key, size, sha, source.mime_type, source.original_filename,
                                   (note or "").strip() or f"Restored from version {source.label}", key, user, major,
                                   restored_from=version_number, scan_engine=source.scan_engine)
-    except IntegrityError:
-        existing = _existing_for_key(key)
-        if existing:
-            return existing, False
-        raise
+    except IntegrityError as exc:
+        return _version_conflict(doc, key, exc), False
     return version, True
 
 
