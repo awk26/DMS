@@ -42,7 +42,8 @@ def create_app(config_object=None, **overrides):
             raise ValueError("DMS_ANGULAR_FRONTEND_URL must be an absolute http(s) URL without credentials or fragment.")
     # MySQL is the only supported database: data access goes through its stored procedures (dms/sp.py).
     if not str(app.config.get("SQLALCHEMY_DATABASE_URI") or "").startswith("mysql"):
-        raise RuntimeError("DATABASE_URL must point to MySQL (mysql+pymysql://...). Check the .env file.")
+        raise RuntimeError("No MySQL database configured: set DB_HOST, DB_PORT, DB_USER, DB_PASSWORD and DB_NAME "
+                           "(or DATABASE_URL=mysql+pymysql://...) in the .env file.")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)

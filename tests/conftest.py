@@ -32,8 +32,9 @@ PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 # ------------------------------------------------------------------- MySQL test database
 
 def _test_database_url():
+    from dms.config import database_uri
     explicit = os.environ.get("TEST_DATABASE_URL")
-    app_url = os.environ.get("DATABASE_URL", "")
+    app_url = database_uri()  # DB_HOST/DB_USER/... or DATABASE_URL, same as the app
     if explicit:
         url = make_url(explicit)
     elif app_url:

@@ -597,7 +597,7 @@ def search(params, resolver, user):
                     continue
                 rank, title_hl, snip = found[0], found[1], ("" if version_hidden else found[2])
             hits.append(Hit("document", d, rank, _marked(title_hl) if title_hl else html.escape(d.name),
-                            _marked(snip) if snip else "", d.updated_at, cv.size if cv else 0,
+                            _marked(snip) if snip else "", d.updated_at, cv.size if cv and not version_hidden else 0,
                             TYPE_LABELS.get(d.extension, d.extension.upper())))
     if params.kind in ("", "email") and user is not None and not _emails_excluded(params):
         ids = [rid for (k, rid) in info if k == "email"] if matches is not None else None

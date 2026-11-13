@@ -12,7 +12,7 @@ def register_cli(app):
     def init_db():
         """Create database tables (safe to run repeatedly)."""
         db.create_all()
-        click.echo(f"Database ready: {app.config['SQLALCHEMY_DATABASE_URI']}")
+        click.echo(f"Database ready: {db.engine.url.render_as_string(hide_password=True)}")
 
     @app.cli.command("install-procedures")
     def install_procedures():

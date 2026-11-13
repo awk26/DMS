@@ -43,6 +43,28 @@ def _str(name, default=""):
     return os.environ.get(name, default).strip()
 
 
+def database_uri():
+    """The MySQL connection URL.
+
+    Preferred: separate settings DB_HOST, DB_PORT (3306), DB_USER, DB_PASSWORD, DB_NAME. The password
+    is used as-is (no URL encoding needed for '@', ':' or '/'). When DB_HOST is not set, DATABASE_URL
+    (a full mysql+pymysql:// URL) is used, as before. Every connection uses utf8mb4 and UTC.
+    """
+    from sqlalchemy.engine import URL
+    host = _str("DB_HOST")
+    if not host:
+        return os.environ.get("DATABASE_URL", "")
+    return URL.create(
+        "mysql+pymysql",
+        username=_str("DB_USER") or None,
+        password=os.environ.get("DB_PASSWORD") or None,  # not stripped: spaces may be part of it
+        host=host,
+        port=_int("DB_PORT", 3306),
+        database=_str("DB_NAME") or None,
+        query={"charset": "utf8mb4", "init_command": "SET time_zone='+00:00'"},
+    ).render_as_string(hide_password=False)
+
+
 class Config:
     APP_NAME = os.environ.get("DMS_APP_NAME", "Archive DMS")
 
@@ -53,9 +75,17 @@ class Config:
     INSTANCE_DIR = _path("DMS_INSTANCE_DIR", BASE_DIR / "instance")
     STORAGE_DIR = _path("DMS_STORAGE_DIR", BASE_DIR / "storage")
 
-    # Required: mysql+pymysql://user:password@host:3306/DMS?charset=utf8mb4 (no fallback database).
-    SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", "")
+    # Required: DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME, or DATABASE_URL (see database_uri()).
+    SQLALCHEMY_DATABASE_URI = database_uri()
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    # Connection pool: DB_POOL_SIZE connections kept open, up to DB_MAX_OVERFLOW extra under load.
+    # pre_ping replaces connections MySQL closed while idle; recycle stays below wait_timeout.
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        "pool_size": _int("DB_POOL_SIZE", 5),
+        "max_overflow": _int("DB_MAX_OVERFLOW", 5),
+        "pool_pre_ping": True,
+        "pool_recycle": _int("DB_POOL_RECYCLE_SECONDS", 3600),
+    }
 
     # Uploads. DMS_MAX_UPLOAD_MB is the default per-file limit (administrators can change it and set
     # per-type limits in Admin > Settings); DMS_MAX_REQUEST_MB is the hard ceiling for any request.
