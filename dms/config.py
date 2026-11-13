@@ -162,6 +162,13 @@ class Config:
     GMAIL_MAX_IMPORT_ATTEMPTS = _int("GMAIL_MAX_IMPORT_ATTEMPTS", 5)
     # Allow the OAuth redirect over plain http (only sensible for localhost).
     OAUTH_ALLOW_HTTP_LOCALHOST = _bool("OAUTH_ALLOW_HTTP_LOCALHOST", True)
+    # Images that archived emails link to (e.g. newsletter logos on mcusercontent.com) are downloaded
+    # once by the server and stored with the email, so the preview shows them without loading anything
+    # from the internet. The original .eml is never changed.
+    EMAIL_REMOTE_IMAGES = _bool("DMS_EMAIL_REMOTE_IMAGES", True)
+    EMAIL_IMAGE_MAX_MB = max(1, _int("DMS_EMAIL_IMAGE_MAX_MB", 5))
+    EMAIL_IMAGE_MAX_COUNT = max(1, _int("DMS_EMAIL_IMAGE_MAX_COUNT", 60))
+    EMAIL_IMAGE_TIMEOUT_SECONDS = max(2, _int("DMS_EMAIL_IMAGE_TIMEOUT_SECONDS", 10))
 
     TESTING = False
 
@@ -202,6 +209,7 @@ class TestConfig(Config):
     SECRET_KEY = "test-secret"
     WTF_CSRF_ENABLED = False
     GMAIL_SYNC_ENABLED = False
+    EMAIL_REMOTE_IMAGES = False  # tests never reach the internet; test_email_images enables it with a fake fetcher
     MAINTENANCE_ENABLED = False
     MALWARE_SCANNER = "builtin"
     FORCE_HTTPS = False

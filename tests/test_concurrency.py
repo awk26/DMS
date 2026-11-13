@@ -64,8 +64,8 @@ def users(app, admin):
 def test_same_new_name_uploaded_at_once_creates_one_document_with_two_versions(users, monkeypatch):
     alice, bob, folder = users
     slow(monkeypatch, doc_svc, "_scan")  # between "does the name exist?" and creating the document
-    r1, r2 = run_together(lambda: alice.upload("report.txt", b"alice", folder_id=folder),
-                          lambda: bob.upload("report.txt", b"bob", folder_id=folder))
+    r1, r2 = run_together(lambda: alice.upload("report.txt", b"alice", folder_id=folder, on_duplicate="replace"),
+                          lambda: bob.upload("report.txt", b"bob", folder_id=folder, on_duplicate="replace"))
     assert {r1.status_code, r2.status_code} == {201}, (r1.json, r2.json)
     assert sorted([r1.json["created"], r2.json["created"]]) == [False, True]
     docs = fresh(Document, folder_id=folder, name="report.txt")
@@ -77,13 +77,25 @@ def test_same_new_name_uploaded_at_once_creates_one_document_with_two_versions(u
 def test_identical_new_file_uploaded_twice_at_once_is_stored_once(users, monkeypatch):
     alice, bob, folder = users
     slow(monkeypatch, doc_svc, "_scan")
-    r1, r2 = run_together(lambda: alice.upload("same.txt", b"same", folder_id=folder),
-                          lambda: bob.upload("same.txt", b"same", folder_id=folder))
+    r1, r2 = run_together(lambda: alice.upload("same.txt", b"same", folder_id=folder, on_duplicate="replace"),
+                          lambda: bob.upload("same.txt", b"same", folder_id=folder, on_duplicate="replace"))
     assert sorted([r1.status_code, r2.status_code]) == [201, 400], (r1.json, r2.json)
     loser = r1 if r1.status_code == 400 else r2
     assert "identical to the current version (1.0)" in loser.json["error"]
     docs = fresh(Document, folder_id=folder, name="same.txt")
     assert len(docs) == 1 and len(fresh(DocumentVersion, document_id=docs[0].id)) == 1
+
+
+def test_identical_new_file_uploaded_at_once_without_confirmation_asks_the_second_uploader(users, monkeypatch):
+    alice, bob, folder = users
+    slow(monkeypatch, doc_svc, "_scan")
+    r1, r2 = run_together(lambda: alice.upload("memo.txt", b"same", folder_id=folder),
+                          lambda: bob.upload("memo.txt", b"same", folder_id=folder))
+    assert sorted([r1.status_code, r2.status_code]) == [201, 409], (r1.json, r2.json)
+    loser = r1 if r1.status_code == 409 else r2
+    assert loser.json["code"] == "duplicate_document"
+    docs = fresh(Document, folder_id=folder, name="memo.txt")
+    assert len(docs) == 1 and [v.label for v in fresh(DocumentVersion, document_id=docs[0].id)] == ["1.0"]
 
 
 # ----------------------------------------------------------------------------- versions of one document

@@ -89,6 +89,17 @@ def _execute(request, retries=3):
             raise
 
 
+def _store_linked_images(record):
+    """Download the images a newly archived email links to (after its commit; never fails the sync).
+    If this fails, they are fetched when the email is first opened."""
+    try:
+        from ..services.email_images import fetch_images
+        fetch_images(record)
+    except Exception:
+        log.exception("Downloading the linked images of email #%s failed", record.id)
+        db.session.rollback()
+
+
 def _status(exc):
     return getattr(getattr(exc, "resp", None), "status", 0)
 
@@ -305,6 +316,7 @@ def _process_queue(service, account, result):
             db.session.commit()
             if created:
                 result.imported += 1
+                _store_linked_images(record)
         except HttpError as exc:
             db.session.rollback()
             if _status(exc) == 404:  # deleted from Gmail before we could import it

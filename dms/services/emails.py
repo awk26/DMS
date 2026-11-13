@@ -27,20 +27,28 @@ log = logging.getLogger(__name__)
 MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
 _WS = re.compile(r"\s+")
 _CID_RE = re.compile(r"""(src|background)\s*=\s*(["']?)cid:([^"'\s>]+)\2""", re.IGNORECASE)
+# cid: references inside CSS (style attributes and <style> blocks): url(cid:logo) / url('cid:logo')
+_CSS_CID_RE = re.compile(r"""url\(\s*(["']?)cid:([^"')\s]+)\1\s*\)""", re.IGNORECASE)
+_CSS_IMPORT_RE = re.compile(r"@import\b[^;]*;?", re.IGNORECASE)
+_DATA_IMAGE_RE = re.compile(r"^data:image/(png|jpe?g|gif|webp|bmp);base64,[A-Za-z0-9+/=\s]+$", re.IGNORECASE)
 
 ALLOWED_TAGS = {
-    "a", "abbr", "b", "blockquote", "br", "caption", "center", "code", "col", "colgroup", "dd", "del",
-    "div", "dl", "dt", "em", "font", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "ins", "kbd",
-    "li", "ol", "p", "pre", "q", "s", "small", "span", "strike", "strong", "sub", "sup", "table",
-    "tbody", "td", "tfoot", "th", "thead", "tr", "u", "ul",
+    "a", "abbr", "address", "article", "aside", "b", "bdi", "bdo", "big", "blockquote", "br", "caption",
+    "center", "cite", "code", "col", "colgroup", "dd", "del", "dfn", "div", "dl", "dt", "em", "figcaption",
+    "figure", "font", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "i", "img", "ins", "kbd",
+    "li", "main", "mark", "nav", "ol", "p", "pre", "q", "s", "samp", "section", "small", "span", "strike",
+    "strong", "style", "sub", "sup", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "tt", "u", "ul",
+    "var", "wbr",
 }
-_COMMON_ATTRS = {"style", "align", "valign", "width", "height", "bgcolor", "color", "dir", "title", "class"}
+# Removed together with their content (never shown as text in the preview).
+CLEAN_CONTENT_TAGS = {"script", "title", "noscript", "template", "iframe", "object", "embed", "svg", "math"}
+_COMMON_ATTRS = {"style", "align", "valign", "width", "height", "bgcolor", "color", "dir", "title", "class", "lang"}
 ALLOWED_ATTRS = {
     "*": _COMMON_ATTRS,
     "a": {"href", "name"},
-    "img": {"src", "alt", "border"},
+    "img": {"src", "alt", "border", "hspace", "vspace"},
     "font": {"face", "size"},
-    "table": {"border", "cellpadding", "cellspacing", "background"},
+    "table": {"border", "cellpadding", "cellspacing", "background", "summary"},
     "td": {"colspan", "rowspan", "nowrap", "background"},
     "th": {"colspan", "rowspan", "nowrap", "background"},
     "col": {"span"},
@@ -48,6 +56,33 @@ ALLOWED_ATTRS = {
 }
 
 SAFE_INLINE_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"}
+
+
+def sniff_image_type(data):
+    """The image type of ``data`` from its leading bytes (None if it is not a safe image type).
+
+    Mail clients often label embedded logos as image/jpg or application/octet-stream."""
+    head = bytes(data[:16]) if data else b""
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[:2] == b"BM":
+        return "image/bmp"
+    return None
+
+
+def _attribute_filter(tag, attr, value):
+    """Allow data: URLs only for base64 images in img src / background; drop them everywhere else."""
+    if value.strip().lower().startswith("data:"):
+        if attr in ("src", "background") and _DATA_IMAGE_RE.match(value.strip()):
+            return value.strip()
+        return None
+    return value
 
 
 def state_from_labels(label_ids):
@@ -91,12 +126,15 @@ def _part_bytes(part):
     return part.get_payload(decode=True) or b""
 
 
+part_bytes = _part_bytes
+
+
 def iter_attachments(msg):
     """Yield (part_index, part, info) for attachment-like and inline-resource parts."""
     for index, part in enumerate(msg.walk()):
-        if part.is_multipart():
-            continue
         ctype = part.get_content_type()
+        if part.is_multipart() and ctype != "message/rfc822":  # a forwarded email is an attachment
+            continue
         disposition = (part.get_content_disposition() or "").lower()
         try:
             filename = part.get_filename()
@@ -321,7 +359,7 @@ def load_message(record):
 
 def find_part(msg, part_index):
     for index, part in enumerate(msg.walk()):
-        if index == part_index and not part.is_multipart():
+        if index == part_index and (not part.is_multipart() or part.get_content_type() == "message/rfc822"):
             return part
     return None
 
@@ -331,37 +369,140 @@ def attachment_bytes(record, part_index):
     return _part_bytes(part) if part is not None else None
 
 
-def render_preview_html(record, inline_url):
+def _is_body_leaf(part):
+    """A text part that is message content rather than an attached file."""
+    if part.get_content_type() not in ("text/plain", "text/html"):
+        return False
+    if (part.get_content_disposition() or "").lower() == "attachment":
+        return False
+    try:
+        return not part.get_filename()
+    except Exception:
+        return True
+
+
+def body_parts(part):
+    """The text parts that make up the visible message, in display order.
+
+    multipart/alternative -> the richest version (HTML before plain text); multipart/related -> its
+    root part; multipart/mixed and others -> every body part in order (some mail clients split one
+    message into several HTML parts). Attached files, including forwarded messages, are never
+    part of the body.
+    """
+    ctype = part.get_content_type()
+    if ctype == "message/rfc822":
+        return []
+    if not part.is_multipart():
+        return [part] if _is_body_leaf(part) else []
+    try:
+        subs = list(part.iter_parts())
+    except Exception:
+        return []
+    subtype = part.get_content_subtype()
+    if subtype == "alternative":
+        options = [found for found in (body_parts(s) for s in subs) if found]
+        for found in reversed(options):
+            if any(p.get_content_type() == "text/html" for p in found):
+                return found
+        return options[-1] if options else []
+    if subtype == "related":
+        return body_parts(subs[0]) if subs else []
+    out = []
+    for sub in subs:
+        out.extend(body_parts(sub))
+    return out
+
+
+def _referenced_cids(html_texts):
+    cids = set()
+    for text in html_texts:
+        cids.update(m.group(3).lower() for m in _CID_RE.finditer(text))
+        cids.update(m.group(2).lower() for m in _CSS_CID_RE.finditer(text))
+    return cids
+
+
+def inline_image_type(part, info=None):
+    """The image type to serve an inline part as, or None if it is not a safe image."""
+    sniffed = sniff_image_type(_part_bytes(part))
+    if sniffed:
+        return sniffed
+    ctype = (info or {}).get("content_type") or part.get_content_type()
+    return ctype if ctype in SAFE_INLINE_IMAGE_TYPES else None
+
+
+def _inline_map(msg, html_texts):
+    """{content-id: part index} for images the HTML body actually shows (cid: references).
+
+    Only these count as inline images; every other part, including images that are attached
+    but not shown in the body, is an attachment."""
+    wanted = _referenced_cids(html_texts)
+    found = {}
+    if not wanted:
+        return found
+    for index, part, info in iter_attachments(msg):
+        cid = (info["content_id"] or "").lower()
+        if cid and cid in wanted and cid not in found and inline_image_type(part, info):
+            found[cid] = index
+    return found
+
+
+def _html_texts(parts):
+    return [_part_text(p) for p in parts if p.get_content_type() == "text/html"]
+
+
+def inline_part_indexes(msg):
+    """Part indexes of the images shown inside the message body."""
+    return set(_inline_map(msg, _html_texts(body_parts(msg))).values())
+
+
+def _sanitise_html(raw_html, cid_map, inline_url, remote_map=None):
+    def repl(m):
+        idx = cid_map.get(m.group(3).lower())
+        return f'{m.group(1)}="{inline_url(idx)}"' if idx is not None else f'{m.group(1)}=""'
+
+    def css_repl(m):
+        idx = cid_map.get(m.group(2).lower())
+        return f"url('{inline_url(idx)}')" if idx is not None else "none"
+
+    raw_html = _CID_RE.sub(repl, raw_html)
+    raw_html = _CSS_CID_RE.sub(css_repl, raw_html)
+    raw_html = _CSS_IMPORT_RE.sub("", raw_html)  # no external stylesheets
+    if remote_map:  # linked images that were downloaded: shown from the DMS, never from the internet
+        from .email_images import transform
+        raw_html = transform(raw_html, remote_map.get)
+    return nh3.clean(
+        raw_html, tags=ALLOWED_TAGS, clean_content_tags=CLEAN_CONTENT_TAGS, attributes=ALLOWED_ATTRS,
+        url_schemes={"http", "https", "mailto", "data"}, attribute_filter=_attribute_filter,
+        link_rel="noopener noreferrer nofollow", strip_comments=True,
+    )
+
+
+def render_preview_html(record, inline_url, image_url=None):
     """Return a sanitised, self-contained HTML document for the email body.
 
-    ``inline_url(part_index)`` builds the URL used for ``cid:`` inline images.
+    The complete body is shown (text, formatting, styles and the images embedded in it).
+    ``inline_url(part_index)`` builds the URL used for ``cid:`` inline images. Attached files are
+    never rendered in the body; the API lists them separately with name, type and size only.
     """
     msg = load_message(record)
-    cid_map = {}
-    for index, part, info in iter_attachments(msg):
-        if info["content_id"] and info["content_type"] in SAFE_INLINE_IMAGE_TYPES:
-            cid_map[info["content_id"].lower()] = index
+    parts = body_parts(msg)
+    cid_map = _inline_map(msg, _html_texts(parts))
+    remote_map = None
+    if image_url is not None:
+        from .email_images import stored_images
+        remote_map = {url: image_url(row.id) for url, row in stored_images(record).items()}
 
-    body_html = None
-    try:
-        body = msg.get_body(preferencelist=("html", "plain"))
-    except Exception:
-        body = None
-    if body is not None and body.get_content_type() == "text/html":
-        raw_html = _part_text(body)
-
-        def repl(m):
-            idx = cid_map.get(m.group(3).lower())
-            return f'{m.group(1)}="{inline_url(idx)}"' if idx is not None else f'{m.group(1)}=""'
-
-        raw_html = _CID_RE.sub(repl, raw_html)
-        body_html = nh3.clean(
-            raw_html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS,
-            url_schemes={"http", "https", "mailto"}, link_rel="noopener noreferrer nofollow",
-            strip_comments=True,
-        )
-    elif body is not None:
-        body_html = f'<pre class="plain">{html.escape(_part_text(body))}</pre>'
+    chunks = []
+    for part in parts:
+        if part.get_content_type() == "text/html":
+            chunks.append(_sanitise_html(_part_text(part), cid_map, inline_url, remote_map))
+        else:
+            chunks.append(f'<pre class="plain">{html.escape(_part_text(part))}</pre>')
+    chunks = [c for c in chunks if c.strip()]
+    if len(chunks) > 1:
+        body_html = "".join(f'<div class="mail-part">{c}</div>' for c in chunks)
+    elif chunks:
+        body_html = chunks[0]
     else:
         body_html = '<p class="empty">This message has no readable text body.</p>'
 
@@ -369,6 +510,7 @@ def render_preview_html(record, inline_url):
         "<!doctype html><html><head><meta charset='utf-8'><base target='_blank'>"
         "<style>body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:14px;"
         "line-height:1.5;color:#1f2937;margin:16px;word-wrap:break-word}img{max-width:100%;height:auto}"
-        "pre.plain{white-space:pre-wrap;font-family:inherit;margin:0}.empty{color:#6b7280}</style>"
+        "pre.plain{white-space:pre-wrap;font-family:inherit;margin:0}.empty{color:#6b7280}"
+        ".mail-part+.mail-part{margin-top:12px}</style>"
         f"</head><body>{body_html}</body></html>"
     )

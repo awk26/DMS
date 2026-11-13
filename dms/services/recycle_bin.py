@@ -5,7 +5,10 @@ from ..models import Document, Folder
 
 
 def can_manage_trashed(item, actor, permission_resolver):
-    return actor.has("records") or item.deleted_by_id == actor.id or permission_resolver.can("delete", item)
+    # No capability bypass (records/admin): another user's private items never show up in someone
+    # else's recycle bin. Records managers still see everything in the Shared library through their
+    # repository-level delete permission.
+    return item.deleted_by_id == actor.id or permission_resolver.can("delete", item)
 
 
 def recycle_bin_items(actor, permission_resolver):

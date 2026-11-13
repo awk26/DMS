@@ -22,7 +22,9 @@ from ..extensions import db
 from ..models import Document, DocumentLink, DocumentVersion, RecentItem, utcnow
 from ..security.malware import scan_stream
 from ..storage import get_storage
-from ..validation import ConflictError, ValidationError, extension_of, validate_name, validate_upload
+from ..validation import (
+    ConflictError, DuplicateDocumentError, ValidationError, extension_of, validate_name, validate_upload,
+)
 from . import search, settings
 from .activity import log_activity, log_folder
 from .folders import NotFound
@@ -113,18 +115,76 @@ def _uid(user):
     return user.id if user is not None else None
 
 
+# ask: prompt about identical content; replace: the user confirmed replacing it;
+# new: the user renamed the file to upload it as a separate document, so it must not collide again.
+ON_DUPLICATE = ("ask", "replace", "new")
+
+
+def _stream_sha256(file_storage):
+    """SHA-256 of an upload without storing it (the stream is rewound afterwards)."""
+    stream = file_storage.stream
+    start = stream.tell()
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+    stream.seek(start)
+    return digest.hexdigest()
+
+
+def duplicate_info(doc, user, sha=None):
+    """What the user is told about the same-named document an upload collides with.
+
+    With ``sha`` (the upload's SHA-256) it also says whether the file is identical to a stored version."""
+    from ..security.permissions import Resolver
+    res = Resolver(user)
+    reason = None
+    if not res.can("edit", doc):
+        reason = "You do not have permission to add versions to the existing document."
+    elif doc.checked_out_by_id and doc.checked_out_by_id != _uid(user):
+        who = doc.checked_out_by.label if doc.checked_out_by else "another user"
+        reason = f"The existing document is checked out by {who}."
+    current = doc.current_version
+    info = {"name": doc.name, "folder_id": doc.folder_id, "can_replace": reason is None, "reason": reason}
+    info["identical"] = False
+    if res.can("view", doc):  # never reveal details of a document the user may not see
+        info.update(document_id=doc.id, version=current.label if current else None,
+                    size=current.size if current else None,
+                    updated_at=doc.updated_at.isoformat() + "Z" if doc.updated_at else None)
+        if sha:
+            same = db.session.execute(select(DocumentVersion).where(
+                DocumentVersion.document_id == doc.id, DocumentVersion.sha256 == sha
+            ).order_by(DocumentVersion.version_number.desc()).limit(1)).scalar_one_or_none()
+            if same is not None:
+                info.update(identical=True, identical_version=same.label,
+                            identical_is_current=same.id == doc.current_version_id)
+    return info
+
+
 def upload_document(file_storage, folder=None, idempotency_key=None, note=None, user=None,
-                    document_type=None, metadata=None, tags=None):
+                    document_type=None, metadata=None, tags=None, on_duplicate="ask", allow_identical=False):
     """Upload a file into ``folder``. Returns (document, created, new_version).
 
     * No document of that name in the folder: a new document, version 1.0
       (created=True, new_version=None).
-    * A document of that name already exists: the file becomes its next minor version
-      (1.0 -> 1.1 -> 1.2 ...), keeping every earlier version (created=False, new_version=the version).
-      Identical content (same SHA-256 as the current version) is refused, so is a document the
-      uploader may not edit or that someone else has checked out.
+    * A document of that name already exists:
+      - with different content: the file becomes its next minor version (1.0 -> 1.1 -> 1.2 ...),
+        keeping every earlier version (created=False, new_version=the version). Refused if the
+        uploader may not edit the document or someone else has it checked out.
+      - with content identical to one of its versions (same SHA-256):
+        ``on_duplicate="ask"`` (default): nothing is stored and DuplicateDocumentError (HTTP 409)
+        tells the user, who can replace it or cancel (cancel = nothing changes).
+        ``on_duplicate="replace"`` + ``allow_identical`` (the user chose Replace): the identical old
+        version is deleted and the upload is stored in its place as the current version, so the
+        document never holds two identical versions. Other versions are kept.
+        ``on_duplicate="replace"`` without ``allow_identical``: refused as identical (HTTP 400).
+      - ``on_duplicate="new"`` (the user renamed the file in the duplicate prompt to keep it as a
+        separate document): refused (HTTP 400) whatever the content, so the renamed upload never
+        silently becomes a version of another document. The user can pick another name.
     * A retried request (same idempotency key): the earlier result (created=False, new_version=None).
     """
+    on_duplicate = (on_duplicate or "ask").strip().lower()
+    if on_duplicate not in ON_DUPLICATE:
+        raise ValidationError("on_duplicate must be one of: " + ", ".join(ON_DUPLICATE))
     key = _clean_key(idempotency_key)
     existing = _existing_for_key(key)
     if existing:
@@ -141,7 +201,21 @@ def upload_document(file_storage, folder=None, idempotency_key=None, note=None, 
         _fresh_snapshot()  # see documents other uploads committed while we waited for the lock
         same_name = find_by_name(display_name, folder_id)
         if same_name is not None:
-            return same_name, False, _version_same_name(same_name, file_storage, key, note, user)
+            if on_duplicate == "new":
+                raise ValidationError(
+                    f"A document named '{same_name.name}' already exists in this folder. "
+                    "Choose a different name.")
+            if on_duplicate != "replace":
+                # Changed content is simply the next version. Identical content is never stored
+                # (or replaced) without asking the user first.
+                info = duplicate_info(same_name, user, sha=_stream_sha256(file_storage))
+                if info.get("identical"):
+                    raise DuplicateDocumentError(
+                        f"'{same_name.name}' already exists in this folder with exactly the same content "
+                        f"(version {info['identical_version']}). Replace it with this upload, or cancel.",
+                        duplicate=info, duplicates=[{"filename": display_name, **info}])
+            return same_name, False, _version_same_name(same_name, file_storage, key, note, user,
+                                                        allow_identical=allow_identical)
         return _create_document(file_storage, folder, display_name, ext, mime, key, note, user,
                                 document_type, metadata, tags)
 
@@ -173,7 +247,9 @@ def _create_document(file_storage, folder, display_name, ext, mime, key, note, u
         grant_owner(doc, user)
         search.index_document(doc)
         log_folder(folder, "document_added", document=doc.name, document_id=doc.id, via="upload")
-        log_activity("document", "uploaded", f"Uploaded '{doc.name}'", doc.id)
+        log_activity("document", "uploaded", f"Uploaded '{doc.name}'", doc.id, entity_name=doc.name,
+                     details={"folder": folder.path if folder else "Root", "version": version.label,
+                              "size": size, "sha256": sha, "note": version.note})
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
@@ -245,13 +321,14 @@ def _check_base_version(doc, base_version):
             current_version=current.label, current_version_number=current.version_number)
 
 
-def _version_same_name(doc, file_storage, key, note, user):
+def _version_same_name(doc, file_storage, key, note, user, allow_identical=False):
     """Add an uploaded file as the next version of the same-named document ``doc``."""
     from ..security.permissions import Resolver
     if not Resolver(user).can("edit", doc):
         raise ValidationError(f"A document named '{doc.name}' already exists in this folder and you do not "
                               "have permission to add versions to it. Rename the file to upload it separately.")
-    version, _ = add_version(doc, file_storage, key, note, user=user)  # refuses content already stored
+    # Refuses content already stored, unless the user confirmed replacing with identical content.
+    version, _ = add_version(doc, file_storage, key, note, user=user, allow_identical=allow_identical)
     return version
 
 
@@ -270,7 +347,7 @@ def checkout(doc, user):
     ensure_unlocked(doc, user)
     doc.checked_out_by_id = user.id
     doc.checked_out_at = utcnow()
-    log_activity("document", "checked_out", f"Checked out '{doc.name}'", doc.id)
+    log_activity("document", "checked_out", f"Checked out '{doc.name}'", doc.id, entity_name=doc.name)
     db.session.commit()
     return doc
 
@@ -285,7 +362,8 @@ def release(doc, user, force=False):
     doc.checked_out_by_id = None
     doc.checked_out_at = None
     log_activity("document", "check_out_cancelled" if not force or holder == user.label else "check_out_overridden",
-                 f"Check-out of '{doc.name}' released" + (f" (was held by {holder})" if force else ""), doc.id)
+                 f"Check-out of '{doc.name}' released" + (f" (was held by {holder})" if force else ""), doc.id,
+                 entity_name=doc.name, details={"held_by": holder})
     db.session.commit()
     return doc
 
@@ -301,7 +379,7 @@ def checkin(doc, user, file_storage=None, note=None, major=False, idempotency_ke
     doc.checked_out_by_id = None
     doc.checked_out_at = None
     log_activity("document", "checked_in", f"Checked in '{doc.name}'" + (f" as {version.label}" if version else ""),
-                 doc.id)
+                 doc.id, entity_name=doc.name, details={"version": version.label} if version else None)
     db.session.commit()
     return version
 
@@ -326,12 +404,29 @@ def _check_comment(note, major):
 
 
 def _append_version(doc, storage_key, size, sha, mime, original_filename, note, key, user, major,
-                    restored_from=None, scan_engine=None):
-    """Insert a version row as the new current version. Cleans up the stored file on failure."""
+                    restored_from=None, scan_engine=None, allow_identical=False, replaces=()):
+    """Insert a version row as the new current version. Cleans up the stored file on failure.
+
+    ``replaces``: versions (identical content) deleted first; their stored files are removed after
+    the commit, and the new version takes their place."""
+    replaced_keys, replaced_labels = [], []
     try:
         current = doc.current_version
-        if current is not None and current.sha256 == sha:
+        current_label = current.label if current else None
+        if current is not None and current.sha256 == sha and not allow_identical:
             raise ValidationError("This content is identical to the current version; no new version was created.")
+        if replaces:
+            from .access import delete_entries_for
+            replaced_keys = [v.storage_key for v in replaces]
+            replaced_labels = [v.label for v in sorted(replaces, key=lambda v: v.version_number)]
+            if doc.current_version_id in {v.id for v in replaces}:
+                doc.current_version = None
+                db.session.flush()
+            delete_entries_for("version", [v.id for v in replaces])
+            for v in replaces:
+                db.session.delete(v)
+            db.session.flush()
+            db.session.expire(doc, ["versions"])
         next_no = (db.session.execute(
             select(func.max(DocumentVersion.version_number)).where(DocumentVersion.document_id == doc.id)
         ).scalar() or 0) + 1
@@ -350,16 +445,24 @@ def _append_version(doc, storage_key, size, sha, mime, original_filename, note, 
             src = next((v for v in doc.versions if v.version_number == restored_from), None)
             restored_label = src.label if src else str(restored_from)
         what = f"restored {restored_label} as {version.label}" if restored_from else f"uploaded {version.label}"
+        if replaced_labels:
+            what = f"replaced identical version {', '.join(replaced_labels)} with a new upload ({version.label})"
         search.index_document(doc)
         log_folder(doc.folder, "document_updated", document=doc.name, document_id=doc.id,
                    version=version.label, restored_from=restored_label)
-        log_activity("document", "restored" if restored_from else "versioned", f"'{doc.name}': {what}", doc.id)
+        action = "restored" if restored_from else "replaced_identical" if replaced_labels else "versioned"
+        log_activity("document", action, f"'{doc.name}': {what}", doc.id,
+                     entity_name=doc.name,
+                     changes={"version": {"old": current_label, "new": version.label}},
+                     details={"size": size, "sha256": sha, "note": version.note, "restored_from": restored_label,
+                              "replaced_versions": replaced_labels or None})
         db.session.commit()
-        return version
     except Exception:
         db.session.rollback()
         get_storage().delete(storage_key)
         raise
+    delete_stored(replaced_keys)  # only after the commit: the replaced versions' files
+    return version
 
 
 def _version_conflict(doc, key, exc):
@@ -372,8 +475,12 @@ def _version_conflict(doc, key, exc):
     raise ConflictError(f"'{doc.name}' was updated by someone else at the same time. Try again.") from None
 
 
-def add_version(doc, file_storage, idempotency_key=None, note=None, user=None, major=False, base_version=None):
+def add_version(doc, file_storage, idempotency_key=None, note=None, user=None, major=False, base_version=None,
+                allow_identical=False):
     """Upload new content for ``doc``. Returns (version, created).
+
+    Content identical to a stored version is refused unless ``allow_identical`` (the user was told
+    and explicitly chose to replace the document anyway).
 
     ``base_version`` (optional) is the version number the uploader started from; if the document
     has moved on since, ConflictError (HTTP 409) is raised instead of silently stacking on top.
@@ -402,7 +509,13 @@ def add_version(doc, file_storage, idempotency_key=None, note=None, user=None, m
         same = db.session.execute(select(DocumentVersion).where(
             DocumentVersion.document_id == doc.id, DocumentVersion.sha256 == sha
         ).order_by(DocumentVersion.version_number.desc()).limit(1)).scalar_one_or_none()
-        if same is not None:
+        replaces = []
+        if same is not None and allow_identical:
+            # The user chose to replace the identical copy: every version with this content is
+            # removed and the upload takes its place (never two identical versions).
+            replaces = db.session.execute(select(DocumentVersion).where(
+                DocumentVersion.document_id == doc.id, DocumentVersion.sha256 == sha)).scalars().all()
+        elif same is not None:
             if same.id == doc.current_version_id:
                 raise ValidationError(f"'{doc.name}' was not changed: the file is identical to the current version "
                                       f"({same.label}), so no new version was created.")
@@ -415,7 +528,7 @@ def add_version(doc, file_storage, idempotency_key=None, note=None, user=None, m
         raise
     try:
         return _append_version(doc, storage_key, size, sha, mime, display_name, note, key, user, major,
-                               scan_engine=scan.engine), True  # commits, which releases the row lock
+                               scan_engine=scan.engine, allow_identical=allow_identical, replaces=replaces), True  # commits, which releases the row lock
     except IntegrityError as exc:
         return _version_conflict(doc, key, exc), False
 
@@ -472,7 +585,8 @@ def rename_document(doc, new_name, user=None):
     doc.name = new_name
     search.index_document_meta(doc)
     log_folder(doc.folder, "document_renamed", document_id=doc.id, old_name=old, new_name=new_name)
-    log_activity("document", "renamed", f"Renamed '{old}' to '{new_name}'", doc.id)
+    log_activity("document", "renamed", f"Renamed '{old}' to '{new_name}'", doc.id, entity_name=new_name,
+                 changes={"name": {"old": old, "new": new_name}})
     db.session.commit()
     return doc
 
@@ -493,7 +607,9 @@ def move_document(doc, folder, user=None):
                moved_to=folder.path if folder else "Root")
     log_folder(folder, "document_added", document=doc.name, document_id=doc.id,
                moved_from=old.path if old else "Root")
-    log_activity("document", "moved", f"Moved '{doc.name}' to {folder.path if folder else 'Root'}", doc.id)
+    log_activity("document", "moved", f"Moved '{doc.name}' to {folder.path if folder else 'Root'}", doc.id,
+                 entity_name=doc.name,
+                 changes={"folder": {"old": old.path if old else "Root", "new": folder.path if folder else "Root"}})
     db.session.commit()
     return doc
 
@@ -529,7 +645,10 @@ def copy_document(doc, folder, user=None, commit=True):
             search.SearchEntry.kind == "document", search.SearchEntry.ref_id == doc.id)).scalar_one_or_none()
         search.index_document(copy, body=entry.body if entry else None)
         log_folder(folder, "document_added", document=copy.name, document_id=copy.id, via="copy")
-        log_activity("document", "copied", f"Copied '{doc.name}' to {folder.path if folder else 'Root'}", copy.id)
+        log_activity("document", "copied", f"Copied '{doc.name}' to {folder.path if folder else 'Root'}", copy.id,
+                     entity_name=copy.name, details={"source_document_id": doc.id, "source_name": doc.name,
+                                                     "source_version": source.label,
+                                                     "folder": folder.path if folder else "Root"})
         if commit:  # a document copied as part of a folder copy is owned through that folder
             from .access import grant_owner
             grant_owner(copy, user)
@@ -555,7 +674,8 @@ def add_link(doc, folder, user=None):
     db.session.add(link)
     log_folder(folder, "shortcut_added", document=doc.name, document_id=doc.id)
     log_activity("document", "shortcut_added",
-                 f"Shortcut to '{doc.name}' added in {folder.path if folder else 'Root'}", doc.id)
+                 f"Shortcut to '{doc.name}' added in {folder.path if folder else 'Root'}", doc.id,
+                 entity_name=doc.name, details={"folder": folder.path if folder else "Root"})
     db.session.commit()
     return link
 
@@ -565,21 +685,36 @@ def remove_link(link):
     db.session.delete(link)
     log_folder(folder, "shortcut_removed", document=doc.name, document_id=doc.id)
     log_activity("document", "shortcut_removed",
-                 f"Shortcut to '{doc.name}' removed from {folder.path if folder else 'Root'}", doc.id)
+                 f"Shortcut to '{doc.name}' removed from {folder.path if folder else 'Root'}", doc.id,
+                 entity_name=doc.name, details={"folder": folder.path if folder else "Root"})
     db.session.commit()
 
 
 def update_metadata(doc, document_type, values, tags, user=None):
     ensure_unlocked(doc, user)
+    from .activity import diff
     from .metadata import apply_values
+    before = _properties_snapshot(doc)
     doc.document_type = document_type
     apply_values(doc, values)
     doc.tags = list(tags)
     doc.updated_at = utcnow()
     db.session.flush()
     search.index_document_meta(doc)
-    log_activity("document", "metadata_updated", f"Updated properties of '{doc.name}'", doc.id)
+    log_activity("document", "metadata_updated", f"Updated properties of '{doc.name}'", doc.id,
+                 entity_name=doc.name, changes=diff(before, _properties_snapshot(doc)))
     db.session.commit()
+
+
+def _properties_snapshot(doc):
+    """Document type, tags and custom field values, for recording what a properties edit changed."""
+    fields = {}
+    for mv in doc.metadata_values:
+        label = mv.field.label if mv.field is not None else f"field {mv.field_id}"
+        fields[label] = mv.value
+    return {"document_type": doc.document_type.name if doc.document_type else None,
+            "tags": sorted(t.name for t in doc.tags),
+            **{f"field: {k}": v for k, v in sorted(fields.items())}}
 
 
 def record_view(doc, user):
@@ -605,17 +740,19 @@ def trash_document(doc, user=None, batch=None, commit=True):
     doc.deleted_by_id = _uid(user)
     search.remove("document", doc.id)
     log_folder(doc.folder, "document_trashed", document=doc.name, document_id=doc.id)
-    log_activity("document", "trashed", f"Moved '{doc.name}' to the recycle bin", doc.id)
+    log_activity("document", "trashed", f"Moved '{doc.name}' to the recycle bin", doc.id, entity_name=doc.name,
+                 details={"folder": doc.folder.path if doc.folder else "Root", "batch": batch})
     if commit:
         db.session.commit()
     return doc
 
 
-def restore_document(doc, commit=True):
+def restore_document(doc, commit=True, user=None):
+    from .folders import restore_target
     if doc.deleted_at is None:
         return doc
     if doc.folder is not None and doc.folder.deleted_at is not None:
-        doc.folder = None  # its folder is (still) in the recycle bin: restore to the top level
+        doc.folder = restore_target(doc.folder, user)  # its folder is (still) in the recycle bin
     if _name_taken(doc.name, doc.folder_id, exclude_id=doc.id):
         doc.name = _unique_name(doc.name, doc.folder_id)
     doc.deleted_at = None
@@ -624,7 +761,8 @@ def restore_document(doc, commit=True):
     db.session.flush()
     search.index_document(doc)
     log_folder(doc.folder, "document_restored", document=doc.name, document_id=doc.id)
-    log_activity("document", "restored_from_trash", f"Restored '{doc.name}' from the recycle bin", doc.id)
+    log_activity("document", "restored_from_trash", f"Restored '{doc.name}' from the recycle bin", doc.id,
+                 entity_name=doc.name, details={"folder": doc.folder.path if doc.folder else "Root"})
     if commit:
         db.session.commit()
     return doc
@@ -647,7 +785,9 @@ def purge_document(doc, commit=True, reason=None):
                                        ).delete(synchronize_session=False)
     search.remove("document", doc_id)
     log_folder(folder, "document_purged", document=name)
-    log_activity("document", "purged", f"Permanently deleted '{name}'" + (f" ({reason})" if reason else ""))
+    log_activity("document", "purged", f"Permanently deleted '{name}'" + (f" ({reason})" if reason else ""),
+                 doc_id, entity_name=name,
+                 details={"folder": folder.path if folder else "Root", "versions": len(version_ids), "reason": reason})
     db.session.delete(doc)
     if commit:
         db.session.commit()

@@ -132,3 +132,27 @@ def register_cli(app):
         """Re-queue imports that failed permanently."""
         from .gmail.sync import retry_failed
         click.echo(f"{retry_failed()} item(s) re-queued.")
+
+    @app.cli.command("email-images")
+    @click.option("--retry", is_flag=True, help="Also retry images whose download failed before.")
+    def email_images(retry):
+        """Download the images archived emails link to (normally done on archive or first view)."""
+        from sqlalchemy import select
+        from .models import ArchivedEmail
+        from .services.email_images import fetch_images
+        stmt = select(ArchivedEmail.id)
+        if not retry:
+            stmt = stmt.where(ArchivedEmail.images_fetched_at.is_(None))
+        total = 0
+        for email_id in db.session.execute(stmt.order_by(ArchivedEmail.id)).scalars().all():
+            record = db.session.get(ArchivedEmail, email_id)
+            try:
+                n = fetch_images(record, retry_failed=retry)
+            except Exception as exc:
+                db.session.rollback()
+                click.echo(f"#{email_id}: failed ({exc})")
+                continue
+            total += n
+            if n:
+                click.echo(f"#{email_id}: {n} image(s) stored")
+        click.echo(f"Done: {total} image(s) stored.")

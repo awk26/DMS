@@ -18,7 +18,7 @@ group.
 |---|---|---|---|
 | FR-FLD-01 | Create, rename, move, copy, delete folders, unlimited depth | `POST /folders`, `PATCH /folders/{id}` (`name`, `parent_id`), `POST /folders/{id}/copy`, `DELETE /folders/{id}` | `services/folders.py` |
 | FR-FLD-02 | Permission inheritance with override at any level | `PATCH /permissions/{kind}/{id}/inheritance`, `POST .../grant`, `GET /permissions/{kind}/{id}` | `security/permissions.py`, `services/access.py` |
-| FR-FLD-03 | Naming conventions, invalid characters, duplicates | enforced on every create/rename/move/upload (an upload whose name already exists in the folder is refused: upload it as a new version) | `validation.validate_name`; `folder_name_pattern`, `document_name_pattern`, `name_max_length` settings |
+| FR-FLD-03 | Naming conventions, invalid characters, duplicates | enforced on every create/rename/move/upload (a same-named upload with changed content becomes a new version; with identical content it is answered with HTTP 409 `duplicate_document` until the user chooses Replace) | `validation.validate_name`; `folder_name_pattern`, `document_name_pattern`, `name_max_length` settings |
 | FR-FLD-04 | Breadcrumbs, favourites, recent items, shortcuts | `breadcrumbs` in `GET /folders/{id}`, `GET /folders/root` and `GET /documents/{id}`; `GET/PUT/DELETE /favourites`; `GET /recent`; `POST /documents/{id}/links`, `DELETE /documents/links/{id}`, `shortcuts` in folder listings | `services/documents.py` (`add_link`, `record_view`) |
 | FR-FLD-05 | Recycle bin, restorable for a configurable period (default 30 days) | `GET/DELETE /recycle-bin`, `POST /folders/{id}/restore`, `POST /documents/{id}/restore`, `.../purge`; `deleted_at`/`expires_at` on items | `services/retention.py` (expiry by the maintenance job), `recycle_bin_days` setting (minimum 30) |
 | FR-DOC-01 | Single/multiple upload, desktop sync client, mobile app | `POST /documents` (one or several `file` parts); personal access tokens (`POST /account/tokens`); `GET /documents?changed_since=` change feed | `services/documents.upload_document` |
@@ -42,6 +42,24 @@ group.
 | FR-SEC-03 | SSO (SAML 2.0, OIDC, Entra ID, Google), LDAP/AD, MFA | `GET /auth/options`, `POST /auth/login`, `POST /auth/mfa`, `/auth/mfa/setup`; `/auth/oidc/{name}`, `/auth/saml/login` redirects | `security/saml.py`, `routes/auth.py` (Authlib OIDC), `security/ldap_auth.py`, TOTP MFA with recovery codes |
 | FR-SEC-04 | TLS 1.2+ in transit; AES-256 at rest; customer-managed keys | `GET /admin/status` reports encryption | `DMS_FORCE_HTTPS` + HSTS, TLS 1.2 minimum in `app.py`; AES-256-GCM envelope encryption (`crypto.py`) |
 | FR-SEC-05 | IP restriction, session timeout, device-based policies | `PUT /admin/settings` (`ip_allowlist`, `session_idle_minutes`, `session_max_hours`, `device_policy`, `blocked_platforms`), `GET/PATCH /admin/devices` | `security/auth.py` |
+
+### Audit log
+
+Every important action is recorded in `activity_log` (`services/activity.py`): uploads, new versions,
+check-out/in, renames, moves, copies, shortcuts, property/metadata edits, recycle bin and permanent deletion of
+documents and folders, sharing, permission grants/removals, inheritance changes, role/user/settings changes,
+sign-ins and Gmail events. Each entry stores **who** (user id, name, IP), **what** (category, action, message),
+**which** item (`entity_type`, `entity_id`, `entity_name` snapshot) and **when** (UTC). Where applicable,
+`details.changes` holds `{field: {old, new}}` (e.g. old/new name, folder, tags, metadata, permission sets).
+
+* **Read access**: `GET /api/v1/activity` requires the `audit` capability (Admin, Records Manager, Auditor).
+  Filters: `category`, `action`, `entity_type`, `entity_id`, `user_id`, `user`, `q`, `date_from`, `date_to`.
+* **Tamper protection**: entries are append-only. The triggers `trg_activity_log_no_update` /
+  `trg_activity_log_no_delete` reject any UPDATE or DELETE, the ORM refuses to flush changes to existing
+  entries, and no API changes or deletes them. The `sp_audit_log_add` procedure and the triggers are installed on
+  start-up if missing (needs CREATE ROUTINE and TRIGGER privileges; otherwise run `flask install-procedures`).
+  Restrict the production database account so it cannot `DROP TRIGGER` or `TRUNCATE` (grant those only to a
+  separate DBA account) for the protection to hold against direct database access.
 
 `PUT /admin/settings` (or `PATCH`) takes a JSON object with only the settings to change; every other
 setting keeps its value. Unknown keys are rejected.
@@ -85,6 +103,26 @@ The app has two separate areas, shown as separate groups in the sidebar:
 |---|---|
 | Files you upload. Documents have versions, live in folders and can be moved, renamed, copied, checked out, trashed and exported as a ZIP. | Emails imported from Gmail, stored as their original `.eml`. They are never versioned, edited or included in document ZIPs. Visible only to the user whose Gmail mailbox they came from. |
 
+**Email preview.** The email page shows the complete message body: text, formatting (inline styles and the
+message's own `<style>` rules, without external stylesheets), every body part, and the images embedded in it
+(`cid:` images such as logos and signatures, and `data:` images). An image counts as inline only when the body
+actually shows it; every other part, including attached images and forwarded emails, is an attachment.
+Attachments are listed with their name, file type and size only; they are not rendered in the body and cannot
+be opened or downloaded from the preview (`GET /emails/{id}/inline/{n}` serves only images the body shows).
+Scripts and remote content stay blocked.
+
+**Linked images (newsletters).** Many emails (e.g. Mailchimp newsletters) do not contain their logos and
+pictures; they link to them on the sender's servers, so the `.eml` holds only the addresses. The server
+downloads each linked image once (when the email is archived, or the first time it is opened), stores it
+encrypted with the email (`email_images` table, `storage/emailimg/`), and the preview shows that copy; the
+browser never loads anything from the internet. Downloads are limited to public http(s) addresses (private and
+internal addresses are refused, redirects re-checked), real PNG/JPEG/GIF/WebP/BMP data, `DMS_EMAIL_IMAGE_MAX_MB`
+(5) per image, `DMS_EMAIL_IMAGE_MAX_COUNT` (60) per email and `DMS_EMAIL_IMAGE_TIMEOUT_SECONDS` (10). Turn it off
+with `DMS_EMAIL_REMOTE_IMAGES=0`. `flask --app app email-images [--retry]` downloads them for all emails at once.
+The archived `.eml` is never changed: **Download original (.eml)** returns it byte for byte, and **Download with
+images (.eml)** (`GET /emails/{id}/eml?with_images=1`) returns a copy with the stored images embedded, which
+shows them in any mail program, even offline.
+
 An email attachment can be copied into the library with **Save to Document Library** (the folder icon
 next to the attachment on the email page). This creates an independent document, which can then be
 versioned like any other. The archived email and its `.eml` file stay unchanged.
@@ -97,9 +135,13 @@ versioned like any other. The archived email and its `.eml` file stay unchanged.
   roles are never given this way). Administrators can turn sign-up off there and create accounts under
   **Admin › Users** instead.
 - **My Files.** Every user has a private **My Files** folder. Uploads and new folders go there unless you are
-  viewing another folder. Nobody else sees it except administrators. All the *My Files* folders sit inside a
-  *Personal files* folder that only administrators see. These folders cannot be renamed, moved or deleted.
+  viewing another folder. Nobody else sees it, administrators included, unless you share it. All the *My Files*
+  folders sit inside a hidden *Personal files* folder. These folders cannot be renamed, moved or deleted.
 - **Shared library.** The top-level folders that all Contributors see. Use it for team content.
+- **Privacy from administrators.** Administrators run the system (users, roles, settings, top-level folders)
+  but cannot see, preview, download, edit or delete any other user's folders or documents, in My Files or in
+  the Shared library, unless that user shares them. They see only what they created or what was shared with
+  them, at the shared level.
 - **Ownership.** Whoever creates a folder or uploads a document gets full control of it, even inside the shared
   library. They can rename, delete and share it.
 - **Sharing.** **Share** on a folder, document or document row: pick a person and an access level (*Can view*,
@@ -129,9 +171,19 @@ folder/document/version under **More › Permissions**.
 
 ### Documents and versions
 
-- **Upload Document** always creates a *new* document (version 1.0). If a file with the same name already
-  exists in the folder, the new document gets a suffix such as `Report (1).pdf`; it never becomes a
-  version of the existing one. Required metadata fields must be filled in.
+- **Upload Document** creates a *new* document (version 1.0). If a document with the same name already exists in
+  the folder:
+  - **different content**: the file is saved straight away as that document's next version (1.0 → 1.1 …); every
+    earlier version and its history are kept.
+  - **identical content** (same name and exactly the same bytes as one of its versions): the user is asked.
+    **Replace** deletes the old identical version (record and stored file) and stores the upload in its place as the
+    current version, so a document never holds two identical versions; other versions are kept. **Cancel** changes
+    nothing and nothing is stored.
+  Required metadata fields must be filled in.
+  API: `POST /documents` (and `POST /documents/import-email-attachment`): an identical file gets HTTP 409
+  `{"code": "duplicate_document", "duplicate": {...}, "duplicates": [...]}` (existing name, version, size,
+  `identical_version`, `can_replace`, `reason`); resend it with `on_duplicate=replace&allow_identical=1` to replace.
+  In a multi-file upload the other files are still uploaded and the identical ones are listed under `duplicates`.
 - To update a document, use **Upload New Version** (minor: 1.0 → 1.1, or major: 1.1 → 2.0) or check the document
   out, edit it, and **Check in** with the new file. The new file must have the same file type.
 - While a document is **checked out**, nobody else can upload versions, rename, move, delete or edit its properties.

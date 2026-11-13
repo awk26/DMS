@@ -18,9 +18,18 @@ class ConflictError(ValidationError):
     ``current`` carries details the client can show or retry with, e.g. the current version.
     """
 
+    code = "conflict"
+
     def __init__(self, message, **current):
         super().__init__(message)
         self.current = current
+
+
+class DuplicateDocumentError(ConflictError):
+    """An upload's name matches a document already in the folder and the user has not confirmed
+    replacing it (HTTP 409, code ``duplicate_document``). Nothing was stored."""
+
+    code = "duplicate_document"
 
 
 # extension -> (mime type, content checker name). Extensions an administrator allows that are not

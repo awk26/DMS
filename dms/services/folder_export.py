@@ -99,6 +99,8 @@ def build_folder_zip(folder, include_versions=False, resolver=None):
                 history_dir = None
                 for doc in _documents(folder_id, resolver):
                     version = doc.current_version
+                    if version is not None and resolver is not None and "download" not in resolver.version(version):
+                        continue  # the current version itself is restricted (version-level permission)
                     doc_name = names.claim(safe_component(doc.name, "document"))
                     if version is None or not storage.exists(version.storage_key):
                         stats["missing"].append(f"{prefix}{doc_name}")

@@ -49,8 +49,11 @@ def _upsert(kind, ref_id, title, body, meta):
     entry.title, entry.body, entry.meta = title or "", body or "", meta or ""
 
 
-def document_meta_text(doc):
-    parts = [doc.extension, TYPE_LABELS.get(doc.extension, ""), doc.folder.path if doc.folder else ""]
+def document_meta_text(doc, with_path=True, with_note=True):
+    """Indexed metadata text. ``with_path``/``with_note`` False leave out the folder path and the current
+    version's note (used at query time for users who may not see a parent folder or that version)."""
+    parts = [doc.extension, TYPE_LABELS.get(doc.extension, ""),
+             doc.folder.path if doc.folder and with_path else ""]
     if doc.document_type:
         parts.append(doc.document_type.name)
     if doc.created_by:
@@ -60,9 +63,27 @@ def document_meta_text(doc):
         if mv.value:
             parts.append(f"{mv.field.label} {mv.value}")
     cv = doc.current_version
-    if cv and cv.note:
+    if cv and cv.note and with_note:
         parts.append(cv.note)
     return " \n".join(p for p in parts if p)
+
+
+@dataclass
+class _TrimmedEntry:
+    """A search entry with the parts the user may not see removed."""
+    title: str
+    body: str
+    meta: str
+
+
+def _visible_top_folder(folder, resolver):
+    """The highest folder above (or at) ``folder`` the user may view, or None."""
+    if folder is None:
+        return None
+    for node in folder.ancestors() + [folder]:
+        if "view" in resolver.folder(node):
+            return node
+    return None
 
 
 def index_document(doc, body=None):
@@ -562,13 +583,19 @@ def search(params, resolver, user):
         for d in docs:
             rank, title_hl, snip, entry = info.get(("document", d.id), (0.0, None, None, None))
             cv = d.current_version
-            if entry is not None and cv is not None and "view" not in resolver.version(cv):
-                # The current version is restricted for this user: match and show only the name and
-                # metadata, never its content (FR-SRC-03).
-                found = _evaluate(node, entry, with_body=False)
+            version_hidden = cv is not None and "view" not in resolver.version(cv)
+            path_hidden = d.folder is not None and any(
+                "view" not in resolver.folder(f) for f in d.folder.ancestors() + [d.folder])
+            if entry is not None and (version_hidden or path_hidden):
+                # Match only what this user may see (FR-SRC-03): never the content or note of a restricted
+                # current version, never the names of folders above the document that are hidden from them.
+                trimmed = _TrimmedEntry(entry.title, "" if version_hidden else entry.body,
+                                        document_meta_text(d, with_path=not path_hidden,
+                                                           with_note=not version_hidden))
+                found = _evaluate(node, trimmed, with_body=not version_hidden)
                 if found is None:
                     continue
-                rank, title_hl, snip = found[0], found[1], ""
+                rank, title_hl, snip = found[0], found[1], ("" if version_hidden else found[2])
             hits.append(Hit("document", d, rank, _marked(title_hl) if title_hl else html.escape(d.name),
                             _marked(snip) if snip else "", d.updated_at, cv.size if cv else 0,
                             TYPE_LABELS.get(d.extension, d.extension.upper())))
@@ -590,10 +617,10 @@ def search(params, resolver, user):
         hits.sort(key=lambda h: h.rank)
     else:
         hits.sort(key=lambda h: h.date or datetime.min, reverse=True)
-    return hits, facets(hits)
+    return hits, facets(hits, resolver)
 
 
-def facets(hits):
+def facets(hits, resolver=None):
     out = {"kind": {}, "type": {}, "folder": {}, "tag": {}, "year": {}, "doctype": {}}
 
     def bump(group, key):
@@ -607,8 +634,12 @@ def facets(hits):
             bump("year", str(h.date.year))
         if h.kind == "document":
             d = h.obj
-            top = d.folder.ancestors()[0] if d.folder and d.folder.ancestors() else d.folder
-            bump("folder", (top.id, top.name) if top else (0, "Root"))
+            if resolver is not None:
+                top = _visible_top_folder(d.folder, resolver)  # never name a folder the user cannot see
+            else:
+                top = d.folder.ancestors()[0] if d.folder and d.folder.ancestors() else d.folder
+            if top is not None or d.folder is None:
+                bump("folder", (top.id, top.name) if top else (0, "Root"))
             for t in d.tags:
                 bump("tag", t.name)
             if d.document_type:

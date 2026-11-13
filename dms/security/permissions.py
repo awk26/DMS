@@ -6,12 +6,25 @@ Permissions are granted by AccessEntry rows on four levels:
 
 A node inherits everything granted on its parent unless inheritance is broken on
 that node (``inherit_permissions = False``); then only the entries on the node
-itself (and below) apply. Grants go to users or roles. Administrators always
-have every permission. ``manage`` implies all other permissions and any grant
-implies ``view``.
+itself (and below) apply. Grants go to users or roles. ``manage`` implies all
+other permissions and any grant implies ``view``.
+
+Privacy: administrators have every permission on the repository root itself so they can run it
+(create top-level folders, manage repository permissions), but those rights do NOT flow down to any
+content: not to other users' My Files and not to folders or documents in the Shared library either.
+An administrator sees, downloads or edits another user's folder, document or version only when it
+was explicitly shared with them (or with a role they hold) on that item or a folder above it, or
+when they created it themselves - exactly like any other user without a role grant.
+
+Item-level access: a grant made to a user personally on a folder, document or version (the Share
+dialog) is that user's exact access to the item and everything below it that inherits. It replaces,
+rather than adds to, what the user would otherwise get from their roles or from parent folders, so
+lowering someone from "Full control" to "Can view" really leaves them view-only, even in the Shared
+library where their role grants more. Grants deeper down (e.g. on a document inside a shared folder)
+override again for that item. Repository-level grants are unchanged (roles and users add up).
 """
 from flask import g, has_request_context
-from sqlalchemy import and_, false, or_, select, true
+from sqlalchemy import and_, false, or_, select
 
 from ..extensions import db
 from ..models import AccessEntry, Document, DocumentVersion, Folder
@@ -35,7 +48,7 @@ SYSTEM_CAPS = ("admin", "records", "audit")
 CAP_LABELS = {
     "admin": "Administration (users, roles, settings; full access)",
     "records": "Records management (recycle bin, retention, check-out override)",
-    "audit": "Audit (activity and security logs)",
+    "audit": "Audit (legacy; every user now sees their own activity log only)",
 }
 
 # name -> (system capabilities, repository-level content permissions, description)
@@ -71,6 +84,8 @@ class Resolver:
 
     def __init__(self, user):
         self.user = user
+        # Administrators manage the repository root only; content access always comes from grants
+        # on the item or a folder above it (see _from_root).
         self.is_admin = bool(user and user.is_admin)
         self.role_ids = {r.id for r in user.roles} if user else set()
         self._entries = None
@@ -87,7 +102,11 @@ class Resolver:
                     and_(AccessEntry.principal_type == "role",
                          AccessEntry.principal_id.in_(self.role_ids or [-1]))))).scalars().all()
                 for e in rows:
-                    self._entries.setdefault((e.target_type, e.target_id), set()).update(e.permission_set)
+                    slot = self._entries.setdefault((e.target_type, e.target_id), {"user": None, "role": set()})
+                    if e.principal_type == "user":
+                        slot["user"] = (slot["user"] or set()) | e.permission_set
+                    else:
+                        slot["role"] |= e.permission_set
         return self._entries
 
     def _folder_map(self):
@@ -98,7 +117,23 @@ class Resolver:
         return self._folders
 
     def _grant(self, target_type, target_id):
-        return set(self._load_entries().get((target_type, target_id), ()))
+        """Everything granted on the node to the user or their roles (no inheritance)."""
+        slot = self._load_entries().get((target_type, target_id))
+        if slot is None:
+            return set()
+        return set(slot["role"]) | set(slot["user"] or ())
+
+    def _resolve(self, target_type, target_id, inherit, inherited):
+        """Permissions on one node. A non-empty personal grant on the node is the user's exact access
+        there (item-level access); otherwise role grants on the node plus, when the node inherits,
+        the permissions on its parent (``inherited()``)."""
+        slot = self._load_entries().get((target_type, target_id))
+        if slot is not None and slot["user"]:
+            return normalize(slot["user"])
+        perms = set(slot["role"]) if slot is not None else set()
+        if inherit:
+            perms |= inherited()
+        return normalize(perms)
 
     # -- resolution ----------------------------------------------------------------------
     def repository(self):
@@ -106,12 +141,17 @@ class Resolver:
             return set(ALL)
         return normalize(self._grant("repository", None))
 
+    def _from_root(self):
+        """What top-level folders and root documents inherit from the repository. Administrators get
+        nothing: their repository rights are for running the system, not for reading users' content."""
+        if self.is_admin:
+            return set()
+        return self.repository()
+
     def folder(self, folder):
         if folder is None:
             return self.repository()
         fid = folder if isinstance(folder, int) else folder.id
-        if self.is_admin:
-            return set(ALL)
         key = ("folder", fid)
         if key in self._memo:
             return self._memo[key]
@@ -120,31 +160,22 @@ class Resolver:
         if info is None:
             return set()
         parent_id, inherit, _ = info
-        perms = self._grant("folder", fid)
-        if inherit:
-            perms |= self.folder(parent_id) if parent_id else self.repository()
-        result = normalize(perms)
+        result = self._resolve("folder", fid, inherit,
+                               lambda: self.folder(parent_id) if parent_id else self._from_root())
         self._memo[key] = result
         return result
 
     def document(self, doc):
-        if self.is_admin:
-            return set(ALL)
         key = ("document", doc.id)
         if key not in self._memo:
-            perms = self._grant("document", doc.id)
-            if doc.inherit_permissions:
-                perms |= self.folder(doc.folder_id) if doc.folder_id else self.repository()
-            self._memo[key] = normalize(perms)
+            self._memo[key] = self._resolve(
+                "document", doc.id, doc.inherit_permissions,
+                lambda: self.folder(doc.folder_id) if doc.folder_id else self._from_root())
         return self._memo[key]
 
     def version(self, version):
-        if self.is_admin:
-            return set(ALL)
-        perms = self._grant("version", version.id)
-        if version.inherit_permissions:
-            perms |= self.document(version.document)
-        return normalize(perms)
+        return self._resolve("version", version.id, version.inherit_permissions,
+                             lambda: self.document(version.document))
 
     def perms(self, obj):
         if obj is None:
@@ -170,8 +201,6 @@ class Resolver:
 
     def visible_documents_clause(self):
         """SQL condition limiting a Document query to documents the user may view."""
-        if self.is_admin:
-            return true()
         if self.user is None:
             return false()
         if "clause" not in self._memo:
@@ -191,7 +220,7 @@ class Resolver:
                     special_visible.append(doc.id)
         folder_ids = self.visible_folder_ids()
         in_folders = [Document.folder_id.in_(folder_ids)] if folder_ids else []
-        if "view" in self.repository():
+        if "view" in self._from_root():
             in_folders.append(Document.folder_id.is_(None))
         inherited = and_(Document.id.not_in(special), or_(*in_folders)) if in_folders else false()
         if special_visible:

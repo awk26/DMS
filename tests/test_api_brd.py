@@ -199,8 +199,10 @@ def test_doc04_check_out_prevents_concurrent_overwrite(api, app, contributor):
     records = Api(app, make_user("rm", ("Records Manager",)))
     doc = contributor.doc("shared.txt", b"v1")
     assert contributor.post(f"/documents/{doc}/checkout").json["document"]["checked_out_by"] == "carl"
-    assert api.version(doc, "shared.txt", b"v2 by admin").status_code == 400
-    assert api.patch(f"/documents/{doc}", {"name": "renamed.txt"}).status_code == 400
+    # The administrator has no access to a user's document at all (privacy); someone with edit is blocked by the lock.
+    assert api.version(doc, "shared.txt", b"v2 by admin").status_code in (403, 404)
+    assert records.version(doc, "shared.txt", b"v2 by records").status_code == 400
+    assert records.patch(f"/documents/{doc}", {"name": "renamed.txt"}).status_code == 400
     assert records.post(f"/documents/{doc}/release").json["document"]["checked_out_by"] is None
     contributor.post(f"/documents/{doc}/checkout")
     form = {"file": (io.BytesIO(b"v2"), "shared.txt"), "note": "edited"}
@@ -339,7 +341,7 @@ def test_sec01_predefined_and_custom_roles(api, reader):
     assert api.delete(f"/admin/roles/{roles['Reader']['id']}").status_code == 400
     assert reader.get("/admin/roles").status_code == 403
     assert reader.post("/folders", json={"name": "Nope"}).status_code == 403
-    assert reader.get("/activity").status_code == 403
+    assert reader.get("/activity").status_code == 200  # personal audit log: own entries only
 
 
 def test_sec02_permissions_at_repository_folder_document_and_version_level(api, reader):

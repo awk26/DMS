@@ -78,6 +78,34 @@ BEGIN
           p_user_name, p_ip, UTC_TIMESTAMP(6));
 END$$
 
+-- @audit-begin  (this block is also installed automatically on app start-up when missing: dms/sp.py)
+-- Audit entry with the affected entity and what changed (details = JSON). Used by dms/services/activity.py.
+DROP PROCEDURE IF EXISTS sp_audit_log_add$$
+CREATE PROCEDURE sp_audit_log_add(
+  IN p_category VARCHAR(20), IN p_action VARCHAR(40), IN p_message VARCHAR(500),
+  IN p_entity_type VARCHAR(20), IN p_entity_id INT, IN p_entity_name VARCHAR(500), IN p_details TEXT,
+  IN p_user_id INT, IN p_user_name VARCHAR(200), IN p_ip VARCHAR(64))
+BEGIN
+  INSERT INTO activity_log (category, action, message, entity_type, entity_id, entity_name, details_json,
+                            user_id, user_name, ip, created_at)
+  VALUES (p_category, p_action, COALESCE(LEFT(p_message, 500), ''), p_entity_type, p_entity_id,
+          LEFT(p_entity_name, 500), p_details, p_user_id, p_user_name, p_ip, UTC_TIMESTAMP(6));
+END$$
+
+-- The audit log is append-only: existing entries can never be changed or removed.
+DROP TRIGGER IF EXISTS trg_activity_log_no_update$$
+CREATE TRIGGER trg_activity_log_no_update BEFORE UPDATE ON activity_log FOR EACH ROW
+BEGIN
+  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Audit log entries cannot be modified.';
+END$$
+
+DROP TRIGGER IF EXISTS trg_activity_log_no_delete$$
+CREATE TRIGGER trg_activity_log_no_delete BEFORE DELETE ON activity_log FOR EACH ROW
+BEGIN
+  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Audit log entries cannot be deleted.';
+END$$
+-- @audit-end
+
 
 -- ================================================================= 2. USERS / LOGIN
 DROP PROCEDURE IF EXISTS sp_user_find_by_login$$

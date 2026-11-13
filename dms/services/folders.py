@@ -56,7 +56,8 @@ HOME_CONTAINER_NAME = "Personal files"
 
 
 def _home_container():
-    """The hidden top-level folder holding every user's My Files (only administrators see it)."""
+    """The hidden top-level folder holding every user's My Files (nobody, administrators included, sees
+    another user's My Files unless it is shared with them)."""
     from . import settings
     folder = db.session.get(Folder, settings.get("home_container_folder_id") or 0)
     if folder is not None and folder.deleted_at is None:
@@ -65,7 +66,8 @@ def _home_container():
     db.session.add(folder)
     db.session.flush()
     settings.set_value("home_container_folder_id", folder.id)
-    log_activity("folder", "created", f"Folder '{folder.name}' created for personal files", folder.id)
+    log_activity("folder", "created", f"Folder '{folder.name}' created for personal files", folder.id,
+                 entity_name=folder.name)
     return folder
 
 
@@ -86,7 +88,8 @@ def ensure_home(user):
     db.session.add(AccessEntry(target_type="folder", target_id=home.id, principal_type="user",
                                principal_id=user.id, permissions=parse_perms(CONTENT_PERMS)))
     user.home_folder_id = home.id
-    log_activity("folder", "created", f"My Files created for '{user.username}'", home.id)
+    log_activity("folder", "created", f"My Files created for '{user.username}'", home.id, entity_name=home.name,
+                 details={"owner": user.username})
     db.session.commit()
     reset_resolver()
     return home
@@ -119,7 +122,8 @@ def create_folder(name, parent=None, user=None):
     grant_owner(folder, user)
     log_folder(folder, "created", parent=_path_label(parent))
     log_folder(parent, "subfolder_added", folder=name, folder_id=folder.id)
-    log_activity("folder", "created", f"Folder '{folder.path}' created", folder.id)
+    log_activity("folder", "created", f"Folder '{folder.path}' created", folder.id, entity_name=folder.path,
+                 details={"parent": _path_label(parent)})
     db.session.commit()
     return folder
 
@@ -134,7 +138,8 @@ def rename_folder(folder, new_name):
     folder.name = new_name
     log_folder(folder, "renamed", old_name=old, new_name=new_name)
     log_folder(folder.parent, "subfolder_renamed", old_name=old, new_name=new_name, folder_id=folder.id)
-    log_activity("folder", "renamed", f"Folder '{old}' renamed to '{new_name}'", folder.id)
+    log_activity("folder", "renamed", f"Folder '{old}' renamed to '{new_name}'", folder.id, entity_name=folder.path,
+                 changes={"name": {"old": old, "new": new_name}})
     _reindex_subtree(folder)
     db.session.commit()
     return folder
@@ -167,7 +172,10 @@ def move_folder(folder, new_parent):
                moved_to=_path_label(new_parent))
     log_folder(new_parent, "subfolder_added", folder=folder.name, folder_id=folder.id,
                moved_from=_path_label(old_parent))
-    log_activity("folder", "moved", f"Folder '{old_path}' moved to '{folder.path}'", folder.id)
+    log_activity("folder", "moved", f"Folder '{old_path}' moved to '{folder.path}'", folder.id,
+                 entity_name=folder.path, changes={"location": {"old": _path_label(old_parent),
+                                                                "new": _path_label(new_parent)},
+                                                   "path": {"old": old_path, "new": folder.path}})
     _reindex_subtree(folder)
     db.session.commit()
     return folder
@@ -243,7 +251,9 @@ def copy_folder(folder, new_parent, user=None, res=None, report=None):
         log_folder(top, "created", copied_from=folder.path)
         log_folder(new_parent, "subfolder_added", folder=top.name, folder_id=top.id)
         note = f" ({skipped} restricted item(s) not copied)" if skipped else ""
-        log_activity("folder", "copied", f"Folder '{folder.path}' copied to '{top.path}'{note}", top.id)
+        log_activity("folder", "copied", f"Folder '{folder.path}' copied to '{top.path}'{note}", top.id,
+                     entity_name=top.path, details={"source_folder_id": folder.id, "source_path": folder.path,
+                                                    "skipped": skipped})
         db.session.commit()
         if report is not None:
             report["skipped"] = skipped
@@ -253,6 +263,24 @@ def copy_folder(folder, new_parent, user=None, res=None, report=None):
         from .documents import delete_stored
         delete_stored(created_keys)
         raise
+
+
+def ensure_can_remove_subtree(nodes, res, action):
+    """The user needs delete permission on every folder and live document in ``nodes`` to take them
+    out of where they are (delete or move). Items the user cannot see are never named in the error."""
+    for node in nodes:
+        if not res.can("delete", node):
+            if res.can("view", node):
+                raise ValidationError(f"You do not have permission to {action} the subfolder '{node.path}'.")
+            raise ValidationError(f"You cannot {action} this folder: it contains items you do not have "
+                                  "access to.")
+        for doc in node.documents:
+            if doc.deleted_at is None and not res.can("delete", doc):
+                if res.can("view", doc):
+                    raise ValidationError(f"You do not have permission to {action} '{doc.name}' in "
+                                          f"'{node.path}'.")
+                raise ValidationError(f"You cannot {action} this folder: it contains items you do not have "
+                                      "access to.")
 
 
 def delete_folder(folder, user=None, res=None):
@@ -265,12 +293,7 @@ def delete_folder(folder, user=None, res=None):
     nodes = subtree(folder)
     _ensure_not_system(nodes, "deleted")
     if res is not None:
-        for node in nodes:
-            if not res.can("delete", node):
-                raise ValidationError(f"You do not have permission to delete the subfolder '{node.path}'.")
-            for doc in node.documents:
-                if doc.deleted_at is None and not res.can("delete", doc):
-                    raise ValidationError(f"You do not have permission to delete '{doc.name}' in '{node.path}'.")
+        ensure_can_remove_subtree(nodes, res, "delete")
     for node in nodes:
         for doc in node.documents:
             if doc.deleted_at is None:
@@ -285,19 +308,35 @@ def delete_folder(folder, user=None, res=None):
         node.deleted_batch = batch
         node.deleted_by_id = user.id if user else None
     log_folder(folder.parent, "subfolder_removed", folder=folder.name, folder_id=folder.id, deleted=True)
-    log_activity("folder", "deleted", f"Folder '{folder.path}' moved to the recycle bin", folder.id)
+    log_activity("folder", "deleted", f"Folder '{folder.path}' moved to the recycle bin", folder.id,
+                 entity_name=folder.path, details={"subfolders": len(nodes) - 1, "batch": batch})
     db.session.commit()
     return batch
 
 
-def restore_folder(folder):
+def restore_target(folder, user=None):
+    """Where to restore an item whose folder is still in the recycle bin.
+
+    The nearest live ancestor keeps it under the same permissions it had (a file from someone's My Files
+    stays private). If no ancestor is live, the item goes to the restoring user's My Files - never to the
+    top level of the Shared library, where it would inherit repository-wide access.
+    """
+    node = folder
+    while node is not None and node.deleted_at is not None:
+        node = node.parent
+    if node is not None:
+        return node
+    return ensure_home(user) if user is not None else None
+
+
+def restore_folder(folder, user=None):
     """Restore a deleted folder with the subfolders and documents deleted together with it."""
     from .documents import restore_document
     if folder.deleted_at is None:
         return folder
     batch = folder.deleted_batch
     if folder.parent is not None and folder.parent.deleted_at is not None:
-        folder.parent = None  # parent still in the recycle bin: restore to the top level
+        folder.parent = restore_target(folder.parent, user)  # parent still in the recycle bin
     folder.name = _unique_name(folder.name, folder.parent_id) if _name_taken(folder.name, folder.parent_id,
                                                                              folder.id) else folder.name
     for node in subtree(folder, include_deleted=True):
@@ -309,7 +348,8 @@ def restore_folder(folder):
     for doc in db.session.execute(select(Document).where(Document.deleted_batch == batch)).scalars():
         restore_document(doc, commit=False)
     log_folder(folder, "restored")
-    log_activity("folder", "restored", f"Folder '{folder.path}' restored from the recycle bin", folder.id)
+    log_activity("folder", "restored", f"Folder '{folder.path}' restored from the recycle bin", folder.id,
+                 entity_name=folder.path)
     db.session.commit()
     return folder
 
@@ -340,7 +380,8 @@ def purge_folder(folder, reason=None):
     for node in reversed(nodes):  # children first
         db.session.delete(node)
         db.session.flush()
-    log_activity("folder", "purged", f"Folder '{path}' permanently deleted" + (f" ({reason})" if reason else ""))
+    log_activity("folder", "purged", f"Folder '{path}' permanently deleted" + (f" ({reason})" if reason else ""),
+                 ids[0], entity_name=path, details={"subfolders": len(ids) - 1, "reason": reason})
     db.session.commit()
     delete_stored(keys)
 

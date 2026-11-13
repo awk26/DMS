@@ -6,7 +6,7 @@ predefined roles and back-fills derived data.
 """
 import logging
 
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 
 from .extensions import db
 
@@ -40,17 +40,79 @@ def _add_missing_columns():
     return added
 
 
+def _add_missing_indexes():
+    """Create model indexes that ``create_all`` skips on tables that already exist."""
+    inspector = inspect(db.engine)
+    existing_tables = set(inspector.get_table_names())
+    added = []
+    for table in db.Model.metadata.sorted_tables:
+        if table.name != "activity_log" or table.name not in existing_tables:
+            continue
+        have = {ix["name"] for ix in inspector.get_indexes(table.name)}
+        for index in table.indexes:
+            if index.name and index.name not in have:
+                index.create(db.engine)
+                added.append(index.name)
+    if added:
+        log.info("Database upgraded: added indexes %s", ", ".join(added))
+
+
+def _audit_objects():
+    """Audit procedure and the triggers that make activity_log append-only."""
+    from .sp import ensure_audit_objects
+    try:
+        with db.engine.begin() as conn:
+            created = ensure_audit_objects(conn)
+        if created:
+            log.info("Installed audit log objects: %s", ", ".join(created))
+    except Exception as exc:  # e.g. the database account may not create triggers
+        log.warning("Could not install the audit log procedure/triggers (%s). Run 'flask install-procedures' "
+                    "with an account that has CREATE ROUTINE and TRIGGER privileges.", exc)
+
+
 def _backfill():
     with db.engine.begin() as conn:
         conn.execute(text("UPDATE document_versions SET major = version_number, minor = 0 WHERE major IS NULL"))
+
+
+def _admin_owner_grants():
+    """Give administrators an explicit owner grant on folders and documents they created.
+
+    Administrators used to reach everything through their repository rights, so no owner grant was
+    written for what they created. Those rights no longer flow down to content (privacy), so without
+    this they would lose access to their own items. Idempotent: only adds missing grants.
+    """
+    from .models import AccessEntry, Document, Folder, User
+    from .security.permissions import CONTENT_PERMS, parse_perms
+    admin_ids = {u.id for u in db.session.execute(select(User)).scalars() if u.is_admin}
+    if not admin_ids:
+        return
+    have = set(db.session.execute(select(AccessEntry.target_type, AccessEntry.target_id, AccessEntry.principal_id)
+                                  .where(AccessEntry.principal_type == "user")).all())
+    added = 0
+    for ttype, model in (("folder", Folder), ("document", Document)):
+        rows = db.session.execute(select(model.id, model.created_by_id)
+                                  .where(model.created_by_id.in_(admin_ids))).all()
+        for oid, uid in rows:
+            if (ttype, oid, uid) not in have:
+                db.session.add(AccessEntry(target_type=ttype, target_id=oid, principal_type="user",
+                                           principal_id=uid, permissions=parse_perms(CONTENT_PERMS),
+                                           created_by_id=uid))
+                added += 1
+    if added:
+        db.session.commit()
+        log.info("Privacy upgrade: added %s owner grant(s) for administrators' own items", added)
 
 
 def upgrade(app):
     from .security.auth import ensure_predefined_roles
     from .services import search
     _add_missing_columns()
+    _add_missing_indexes()
+    _audit_objects()
     _backfill()
     ensure_predefined_roles()
+    _admin_owner_grants()
     # Index existing content the first time search is available.
     from .models import ArchivedEmail, Document, SearchEntry
     if db.session.query(SearchEntry.id).first() is None and (

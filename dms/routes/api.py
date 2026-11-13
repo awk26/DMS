@@ -8,7 +8,7 @@ The same permissions, IP restrictions, file-type rules, malware scanning, check-
 and audit logging apply as in the web interface. Sync clients use ``changed_since`` to
 fetch only what changed since their last run.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 import io
 import math
@@ -61,7 +61,7 @@ from ..security.auth import (
 from ..security.permissions import CONTENT_PERMS, SYSTEM_CAPS, parse_perms, resolver, reset_resolver
 from ..services import access as access_svc
 from ..services import documents as svc, emails as email_svc, metadata as meta_svc, search as search_svc
-from ..services.activity import log_activity
+from ..services.activity import diff, log_activity
 from ..services.folders import (
     NotFound,
     create_folder,
@@ -72,11 +72,13 @@ from ..services.folders import (
     purge_folder,
     rename_folder,
     restore_folder,
+    subtree,
+    ensure_can_remove_subtree,
 )
 from ..services.compare import compare_versions, supported as compare_supported
 from ..services.preview import html_rendition, office_preview_mode, pdf_rendition
 from ..services.retention import recycle_expiry
-from ..validation import NEVER_INLINE, ConflictError, ValidationError, preview_kind
+from ..validation import NEVER_INLINE, ConflictError, DuplicateDocumentError, ValidationError, preview_kind
 from ..services.recycle_bin import can_manage_trashed, recycle_bin_items
 from ..services.users import apply_user_data
 from ._helpers import folder_zip_response, send_version, stream_stored
@@ -180,7 +182,7 @@ def api_auth(view):
             return view(*args, **kwargs)
         except ConflictError as exc:
             db.session.rollback()
-            return jsonify(ok=False, error=str(exc), code="conflict", **exc.current), 409
+            return jsonify(ok=False, error=str(exc), code=exc.code, **exc.current), 409
         except StaleDataError:
             # Optimistic locking: another request changed this row since it was read (documents.row_version).
             db.session.rollback()
@@ -432,8 +434,14 @@ def _iso(value):
     return value.isoformat() + "Z" if value else None
 
 
+def _visible_path(f):
+    """Folder path in which ancestors hidden from the user are shown as "…" (never their names)."""
+    res = resolver()
+    return " / ".join([a.name if "view" in res.folder(a) else "…" for a in f.ancestors()] + [f.name])
+
+
 def _folder_json(f):
-    data = {"id": f.id, "name": f.name, "parent_id": f.parent_id, "path": f.path,
+    data = {"id": f.id, "name": f.name, "parent_id": f.parent_id, "path": _visible_path(f),
             "updated_at": f.updated_at.isoformat() + "Z", "permissions": sorted(resolver().folder(f))}
     if f.deleted_at is not None:
         data.update(deleted_at=_iso(f.deleted_at), expires_at=_iso(recycle_expiry(f.deleted_at)))
@@ -442,11 +450,14 @@ def _folder_json(f):
 
 def _doc_json(d):
     cv = d.current_version
+    version_label, version_number = (cv.label, cv.version_number) if cv else (None, None)
+    if cv is not None and "view" not in resolver().version(cv):
+        cv = None  # the current version is restricted for this user: do not expose its size, hash or type
     data = {
         "id": d.id, "name": d.name, "extension": d.extension, "folder_id": d.folder_id,
         "size": cv.size if cv else 0, "sha256": cv.sha256 if cv else None,
         "mime_type": cv.mime_type if cv else None,
-        "version": cv.label if cv else None, "version_number": cv.version_number if cv else None,
+        "version": version_label, "version_number": version_number,
         "author": d.created_by.username if d.created_by else None,
         "created_at": d.created_at.isoformat() + "Z", "updated_at": d.updated_at.isoformat() + "Z",
         "deleted": d.deleted_at is not None, "row_version": d.row_version,
@@ -479,8 +490,12 @@ def _crumbs(folder):
     if home in ids:
         chain = chain[ids.index(home):]
     res = resolver()
-    return [{"id": f.id, "name": "My Files" if f.id == home else f.name, "can_view": "view" in res.folder(f)}
-            for f in chain]
+    out = []
+    for f in chain:
+        visible = "view" in res.folder(f)
+        name = "My Files" if f.id == home else (f.name if visible else "…")  # hidden folders stay unnamed
+        out.append({"id": f.id, "name": name, "can_view": visible})
+    return out
 
 
 def _visible_links(folder):
@@ -493,7 +508,8 @@ def _visible_links(folder):
     ).scalars().all()
 
 
-def _email_json(record):
+def _email_json(record, inline=None):
+    """``inline``: part indexes shown inside the body (detail view); None = as recorded at archive time."""
     return {
         "id": record.id,
         "gmail_message_id": record.gmail_message_id,
@@ -512,7 +528,8 @@ def _email_json(record):
         "scan_status": record.scan_status,
         "attachments": [
             {"part_index": item.part_index, "filename": item.filename, "content_type": item.content_type,
-             "size": item.size, "is_inline": item.is_inline}
+             "size": item.size,
+             "is_inline": item.is_inline if inline is None else item.part_index in inline}
             for item in record.attachments
         ],
     }
@@ -574,7 +591,7 @@ def root_folder():
     """Top level of the library: root folders (plus shared folders whose parent is hidden) and root documents."""
     from ..services.folders import folder_tree
     res = resolver()
-    tree = folder_tree(None if res.is_admin else res.visible_folder_ids())
+    tree = folder_tree(res.visible_folder_ids())
     documents = db.session.execute(
         select(Document).where(Document.deleted_at.is_(None), Document.folder_id.is_(None),
                                res.visible_documents_clause())
@@ -615,6 +632,8 @@ def update_folder(folder_id):
         _need("delete", folder)
         destination = get_folder(data.get("parent_id"))
         _need("edit", destination)
+        # Moving takes everything out of its current place, exactly like delete: check the whole subtree.
+        ensure_can_remove_subtree(subtree(folder), resolver(), "move")
         move_folder(folder, destination)
     return jsonify(ok=True, folder=_folder_json(folder))
 
@@ -636,10 +655,13 @@ def copy_folder_api(folder_id):
 @bp.patch("/folders/<int:folder_id>/retention")
 @api_auth
 def update_folder_retention(folder_id):
-    from ..services.activity import log_activity
+    from ..services.activity import diff, log_activity
     folder = get_folder(folder_id)
     if not g.user.has("records") and not g.user.is_admin:
         abort(403)
+    # The capability alone is not enough: version pruning destroys content, so the caller must also
+    # manage this folder (an administrator has no access to other users' folders).
+    _need("manage", folder)
     data = _body()
 
     def retention_value(name):
@@ -648,9 +670,12 @@ def update_folder_retention(folder_id):
             return None
         return _integer(raw, name, 0)
 
+    old = {"keep_last": folder.version_keep_last, "keep_years": folder.version_keep_years}
     folder.version_keep_last = retention_value("keep_last")
     folder.version_keep_years = retention_value("keep_years")
-    log_activity("folder", "retention_set", f"Version retention updated for '{folder.path}'", folder.id)
+    log_activity("folder", "retention_set", f"Version retention updated for '{folder.path}'", folder.id,
+                 entity_name=folder.path,
+                 changes=diff(old, {"keep_last": folder.version_keep_last, "keep_years": folder.version_keep_years}))
     db.session.commit()
     return jsonify(ok=True, keep_last=folder.version_keep_last, keep_years=folder.version_keep_years)
 
@@ -671,7 +696,7 @@ def restore_folder_api(folder_id):
     folder = get_folder(folder_id, include_deleted=True)
     if not can_manage_trashed(folder, g.user, resolver()):
         abort(403)
-    restore_folder(folder)
+    restore_folder(folder, user=g.user)
     return jsonify(ok=True, folder=_folder_json(folder))
 
 
@@ -685,6 +710,26 @@ def purge_folder_api(folder_id):
     return jsonify(ok=True)
 
 
+def _history_row_visible(row):
+    """Hide folder-history events about documents or subfolders the user may not view (their names are in
+    the event details)."""
+    res = resolver()
+    details = row.details or {}
+    doc_id = details.get("document_id")
+    sub_id = details.get("folder_id")
+    if doc_id:
+        doc = db.session.get(Document, doc_id)
+        if doc is not None:
+            return "view" in res.document(doc)
+    if sub_id and sub_id != row.folder_id:
+        if db.session.get(Folder, sub_id) is not None:
+            return "view" in res.folder(sub_id)
+    if doc_id or "document" in details or (sub_id and sub_id != row.folder_id):
+        # The item is gone (e.g. permanently deleted): only people who manage the folder see its name.
+        return "manage" in res.folder(row.folder_id)
+    return True
+
+
 @bp.get("/folders/<int:folder_id>/history")
 @api_auth
 def folder_history(folder_id):
@@ -694,6 +739,7 @@ def folder_history(folder_id):
         select(FolderActivity).where(FolderActivity.folder_id == folder.id)
         .order_by(FolderActivity.created_at.desc(), FolderActivity.id.desc())
     ).scalars().all()
+    rows = [row for row in rows if _history_row_visible(row)]
     return jsonify(events=[{
         "id": row.id, "folder_id": row.folder_id, "folder_name": row.folder_name,
         "action": row.action, "details": row.details, "user_name": row.user_name,
@@ -752,7 +798,9 @@ def document(doc_id):
     svc.record_view(doc, g.user)  # feeds /recent (FR-FLD-04)
     cv = doc.current_version
     kind = preview_kind(doc.extension)
-    links = [link for link in doc.links if link.folder is None or link.folder.deleted_at is None]
+    # Only shortcuts in folders the user may see: the others' folder paths are not theirs to know.
+    links = [link for link in doc.links if link.folder is None or (
+        link.folder.deleted_at is None and "view" in resolver().folder(link.folder))]
     return jsonify(document=_doc_json(doc),
                    breadcrumbs=_crumbs(doc.folder),
                    versions=[_version_json(v) for v in doc.versions if "view" in resolver().version(v)],
@@ -803,14 +851,26 @@ def preview_document(doc_id):
     doc = svc.get_document(doc_id)
     _need("view", doc)
     version = _readable_version(doc, "view")
+    view_only = "download" not in resolver().version(version)
+    if view_only and request.headers.get("Sec-Fetch-Dest") == "document":
+        # View-only access: the preview is shown inside the app (iframe/img/video), but opening the
+        # raw file as a page of its own (to save it from there) is a download in disguise.
+        abort(403, description="You have view-only access to this document. Open it in the document viewer.")
     kind = preview_kind(doc.extension)
+    resp = None
     if kind in ("pdf", "image", "text", "video", "audio") and doc.extension not in NEVER_INLINE:
-        return _frameable(send_version(doc, version, inline=True))
-    if kind == "office":
+        resp = _frameable(send_version(doc, version, inline=True))
+    elif kind == "office":
         key = pdf_rendition(version)
         if key:
-            return _frameable(stream_stored(key, "application/pdf", doc.name.rsplit(".", 1)[0] + ".pdf",
+            resp = _frameable(stream_stored(key, "application/pdf", doc.name.rsplit(".", 1)[0] + ".pdf",
                                             as_attachment=False))
+    if resp is not None:
+        if view_only:
+            resp.headers["Cache-Control"] = "no-store, private"
+            resp.headers["Content-Disposition"] = "inline"
+        return resp
+    if kind == "office":
         raise NotFound("No PDF rendition is available for this file; use the /render endpoint instead.")
     raise NotFound("Preview is not available for this file type.")
 
@@ -862,28 +922,43 @@ def upload():
     document_type = meta_svc.document_type_from_form(form)
     values = meta_svc.values_from_form(form, folder, document_type.id if document_type else None)
     tags = meta_svc.resolve_tags(meta_svc.parse_tags(form.get("tags")))
-    # A file whose name already exists in the folder becomes that document's next version.
+    # A file whose name already exists in the folder is only stored, as that document's next
+    # version, when the user confirmed it (on_duplicate=replace). Otherwise nothing is stored for
+    # it and the response lists it under "duplicates" (HTTP 409 when nothing else was uploaded).
+    on_duplicate = form.get("on_duplicate") or "ask"
+    # Sent by the client only after the user was told the file is identical and still chose Replace.
+    allow_identical = str(form.get("allow_identical", "")).lower() in ("1", "true", "yes")
     if len(files) > 1:
         # Several files in one request: each is an independent upload with its own outcome.
-        done, versioned, errors = [], [], []
+        done, versioned, errors, duplicates = [], [], [], []
         for file in files:
             try:
                 doc, _, version = svc.upload_document(file, folder, note=form.get("note"), user=g.user,
-                                                      document_type=document_type, metadata=values, tags=tags)
+                                                      document_type=document_type, metadata=values, tags=tags,
+                                                      on_duplicate=on_duplicate, allow_identical=allow_identical)
                 done.append(doc)
                 if version is not None:
                     versioned.append({"document_id": doc.id, "name": doc.name, "version": version.label})
+            except DuplicateDocumentError as exc:
+                db.session.rollback()
+                duplicates.extend(exc.current["duplicates"])
             except ValidationError as exc:
                 db.session.rollback()
                 errors.append({"filename": file.filename, "error": str(exc)})
         if not done:
+            if duplicates:
+                return jsonify(ok=False, code="duplicate_document", documents=[], errors=errors,
+                               duplicates=duplicates,
+                               error="Documents with these names already exist in this folder. "
+                                     "Replace them with new versions, or cancel the upload."), 409
             return jsonify(ok=False, error="None of the files could be uploaded.", code="validation_error",
                            documents=[], errors=errors), 400
         return jsonify(ok=True, documents=[_doc_json(doc) for doc in done], versioned=versioned,
-                       errors=errors), 201
+                       errors=errors, duplicates=duplicates), 201
     doc, created, version = svc.upload_document(files[0], folder, form.get("idempotency_key"),
                                                 form.get("note"), user=g.user, document_type=document_type,
-                                                metadata=values, tags=tags)
+                                                metadata=values, tags=tags, on_duplicate=on_duplicate,
+                                                allow_identical=allow_identical)
     return jsonify(ok=True, created=created, versioned=version is not None,
                    version=version.label if version else None, document=_doc_json(doc)), \
         201 if (created or version is not None) else 200
@@ -974,6 +1049,8 @@ def copy_document_api(doc_id):
     data = _body()
     doc = svc.get_document(doc_id)
     _need("download", doc)
+    if doc.current_version is not None:
+        _need("download", doc.current_version)  # a copy hands out the content: respect version-level limits
     destination = get_folder(data.get("folder_id"))
     _need("edit", destination)
     copied = svc.copy_document(doc, destination, g.user)
@@ -986,7 +1063,8 @@ def restore_document_version(doc_id, number):
     doc = svc.get_document(doc_id)
     _need("edit", doc)
     version = svc.get_version(doc, number)
-    _need("view", version)
+    # Restoring re-publishes that version's content as the current one, so it needs download, not just view.
+    _need("download", version)
     form = _body()
     restored, created = svc.restore_version(
         doc, number, form.get("idempotency_key"), user=g.user,
@@ -1003,7 +1081,7 @@ def restore_document_api(doc_id):
     doc = svc.get_document(doc_id, include_deleted=True)
     if not can_manage_trashed(doc, g.user, resolver()):
         abort(403)
-    svc.restore_document(doc)
+    svc.restore_document(doc, user=g.user)
     return jsonify(ok=True, document=_doc_json(doc))
 
 
@@ -1181,16 +1259,32 @@ def _own_email(email_id):
 @api_auth
 def email_detail(email_id):
     record = _own_email(email_id)
-    return jsonify(email=_email_json(record))
+    # Which parts are images shown inside the body (inline) and which are attached files, decided
+    # from the message itself. Attached files are listed with name, type and size only.
+    try:
+        inline = email_svc.inline_part_indexes(email_svc.load_message(record))
+    except FileNotFoundError:
+        inline = None  # original file missing: fall back to what was recorded at archive time
+    return jsonify(email=_email_json(record, inline))
 
 
 @bp.get("/emails/<int:email_id>/body")
 @api_auth
 def email_body(email_id):
     record = _own_email(email_id)
+    from ..services import email_images
+    if record.images_fetched_at is None and current_app.config.get("EMAIL_REMOTE_IMAGES"):
+        # First view of an email archived before images were downloaded (or whose download failed
+        # during sync): fetch the images its body links to now. Never blocks showing the email.
+        try:
+            email_images.fetch_images(record)
+        except Exception:
+            current_app.logger.exception("Downloading the linked images of email #%s failed", record.id)
+            db.session.rollback()
     try:
         html_doc = email_svc.render_preview_html(
-            record, lambda idx: url_for("api.email_inline_part", email_id=record.id, part_index=idx)
+            record, lambda idx: url_for("api.email_inline_part", email_id=record.id, part_index=idx),
+            image_url=lambda image_id: url_for("api.email_linked_image", email_id=record.id, image_id=image_id),
         )
     except FileNotFoundError:
         raise NotFound("The original message file is missing.")
@@ -1202,6 +1296,16 @@ def email_body(email_id):
 def email_eml(email_id):
     record = _own_email(email_id)
     name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", record.subject or "").strip(" .")[:80] or "message"
+    if request.args.get("with_images") == "1":
+        # A copy with the linked images embedded, so it shows them in any mail program, even offline.
+        # The archived original (below, the default) stays byte-for-byte unchanged.
+        from ..services import email_images
+        try:
+            data = email_images.eml_with_images(record)
+        except FileNotFoundError:
+            raise NotFound("The original message file is missing.")
+        return send_file(io.BytesIO(data), mimetype="message/rfc822", as_attachment=True, max_age=0,
+                         download_name=f"{name} [{record.gmail_message_id}] (with images).eml")
     return stream_stored(record.storage_key, "message/rfc822", f"{name} [{record.gmail_message_id}].eml",
                          as_attachment=True, etag=record.sha256)
 
@@ -1225,6 +1329,25 @@ def email_attachment(email_id, part_index):
                      download_name=filename, max_age=0)
 
 
+@bp.get("/emails/<int:email_id>/images/<int:image_id>")
+@api_auth
+def email_linked_image(email_id, image_id):
+    """A stored copy of an image the email's body links to (see services/email_images.py)."""
+    from ..models import EmailImage
+    from ..storage import get_storage
+    record = _own_email(email_id)
+    row = db.session.get(EmailImage, image_id)
+    if row is None or row.email_id != record.id or row.status != "stored" or not row.storage_key:
+        raise NotFound("Image not found.")
+    try:
+        content = get_storage().read_bytes(row.storage_key)
+    except FileNotFoundError:
+        raise NotFound("Image not found.")
+    response = send_file(io.BytesIO(content), mimetype=row.content_type, max_age=3600)
+    response.headers["Content-Security-Policy"] = "default-src 'none'"
+    return response
+
+
 @bp.get("/emails/<int:email_id>/inline/<int:part_index>")
 @api_auth
 def email_inline_part(email_id, part_index):
@@ -1232,12 +1355,21 @@ def email_inline_part(email_id, part_index):
     attachment = db.session.execute(select(EmailAttachment).where(
         EmailAttachment.email_id == record.id, EmailAttachment.part_index == part_index
     )).scalar_one_or_none()
-    if attachment is None or attachment.content_type not in email_svc.SAFE_INLINE_IMAGE_TYPES:
+    if attachment is None:
         raise NotFound("Inline image not found.")
-    content = email_svc.attachment_bytes(record, part_index)
-    if content is None:
-        raise NotFound("Inline image not found in the original message.")
-    response = send_file(io.BytesIO(content), mimetype=attachment.content_type, max_age=3600)
+    try:
+        msg = email_svc.load_message(record)
+    except FileNotFoundError:
+        raise NotFound("The original message file is missing.")
+    part = email_svc.find_part(msg, part_index)
+    # Only images that the message body shows are served here; attached files are not.
+    if part is None or part_index not in email_svc.inline_part_indexes(msg):
+        raise NotFound("Inline image not found.")
+    mimetype = email_svc.inline_image_type(part, {"content_type": attachment.content_type})
+    if mimetype is None:
+        raise NotFound("Inline image not found.")
+    content = email_svc.part_bytes(part)
+    response = send_file(io.BytesIO(content), mimetype=mimetype, max_age=3600)
     response.headers["Content-Security-Policy"] = "default-src 'none'"
     return response
 
@@ -1266,6 +1398,8 @@ def import_email_attachment():
     doc, created, version = svc.upload_document(
         file, folder, data.get("idempotency_key"),
         note=f"Imported from archived email: {subject}", user=g.user,
+        on_duplicate=data.get("on_duplicate") or "ask",
+        allow_identical=str(data.get("allow_identical", "")).lower() in ("1", "true", "yes"),
     )
     return jsonify(ok=True, created=created, versioned=version is not None,
                    version=version.label if version else None, document=_doc_json(doc)), \
@@ -1433,7 +1567,11 @@ def permissions(kind, obj_id, number=None):
     target = _target(kind, obj_id, number)
     _need("view", target)
     entries = []
-    for entry in access_svc.entries_for(target):
+    res = resolver()
+    # Who has access is visible only to people who may share or manage the item; others get their own
+    # effective permissions and nothing else.
+    may_see_entries = res.can("share", target) or res.can("manage", target)
+    for entry in (access_svc.entries_for(target) if may_see_entries else []):
         entries.append({
             "id": entry.id,
             "principal_type": entry.principal_type,
@@ -1599,18 +1737,52 @@ def recent_versions():
 @api_auth
 def activity():
     from ..models import ActivityLog
-    if not g.user.has("audit"):
-        abort(403)
+    # The audit log is personal: every signed-in user (administrators included) sees only the
+    # entries for actions they performed themselves, never other users' activity.
+    # Read-only: the audit log has no endpoint that changes or deletes entries.
     page = max(1, request.args.get("page", 1, type=int))
     per_page = min(100, max(1, request.args.get("per_page", 50, type=int)))
-    stmt = select(ActivityLog).order_by(ActivityLog.created_at.desc(), ActivityLog.id.desc())
+    own = ActivityLog.user_id == g.user.id
+    stmt = select(ActivityLog).where(own)
+    args = request.args
+    for name, column in (("category", ActivityLog.category), ("action", ActivityLog.action),
+                         ("entity_type", ActivityLog.entity_type)):
+        if args.get(name):
+            stmt = stmt.where(column == args.get(name).strip())
+    if args.get("entity_id"):
+        stmt = stmt.where(ActivityLog.entity_id == _integer(args.get("entity_id"), "entity_id", 0))
+    if args.get("q"):
+        needle = args.get("q").strip()
+        stmt = stmt.where(ActivityLog.message.contains(needle, autoescape=True)
+                          | ActivityLog.entity_name.contains(needle, autoescape=True))
+    date_from, date_to = _audit_date(args.get("date_from"), "date_from"), _audit_date(args.get("date_to"), "date_to")
+    if date_from:
+        stmt = stmt.where(ActivityLog.created_at >= date_from)
+    if date_to:
+        stmt = stmt.where(ActivityLog.created_at < date_to + timedelta(days=1))
     total = db.session.execute(select(func.count()).select_from(stmt.subquery())).scalar()
+    stmt = stmt.order_by(ActivityLog.created_at.desc(), ActivityLog.id.desc())
     rows = db.session.execute(stmt.limit(per_page).offset((page - 1) * per_page)).scalars().all()
+    # Login names alongside the display names stored with each entry (display names need not be unique).
+    ids = {item.user_id for item in rows if item.user_id}
+    usernames = dict(db.session.execute(select(User.id, User.username).where(User.id.in_(ids))).all()) if ids else {}
     return jsonify(events=[{
         "id": item.id, "category": item.category, "action": item.action, "message": item.message,
-        "entity_id": item.entity_id, "user_id": item.user_id, "user_name": item.user_name,
+        "entity_id": item.entity_id, "entity_type": item.entity_type, "entity_name": item.entity_name,
+        "details": item.details, "user_id": item.user_id, "user_name": item.user_name,
+        "username": usernames.get(item.user_id), "ip": item.ip,
         "created_at": item.created_at.isoformat() + "Z",
-    } for item in rows], total=total, page=page, per_page=per_page)
+    } for item in rows], total=total, page=page, per_page=per_page,
+        categories=sorted(db.session.execute(select(ActivityLog.category).where(own).distinct()).scalars()))
+
+
+def _audit_date(value, name):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value.strip()[:10], "%Y-%m-%d")
+    except ValueError:
+        raise ValidationError(f"'{name}' must be a date (YYYY-MM-DD).") from None
 
 
 @bp.get("/dashboard")
@@ -1750,6 +1922,7 @@ def admin_update_user(user_id):
     if user is None:
         raise NotFound("User not found.")
     action = data.get("action", "save")
+    before = _user_audit_snapshot(user)
     if action == "reset_mfa":
         user.mfa_enabled, user.mfa_secret, user.mfa_recovery_json = False, None, "[]"
     elif action == "unlock":
@@ -1775,10 +1948,27 @@ def admin_update_user(user_id):
                 raise ValidationError("At least one active administrator must remain.")
     else:
         raise ValidationError("Unknown user action.")
-    log_activity("admin", "user_updated", f"User '{user.username}' updated", user.id)
+    log_activity("admin", "user_updated", f"User '{user.username}' updated", user.id, entity_type="user",
+                 entity_name=user.username, changes=diff(before, _user_audit_snapshot(user)),
+                 details={"action": action})
     db.session.commit()
     reset_resolver()
     return jsonify(ok=True, user=_user_json(user))
+
+
+def _user_audit_snapshot(user):
+    return {"display_name": user.display_name, "email": user.email, "auth_source": user.auth_source,
+            "is_active": bool(user.is_active), "roles": sorted(r.name for r in user.roles),
+            "mfa_enabled": bool(user.mfa_enabled), "locked": user.locked_until is not None}
+
+
+def _role_audit_snapshot(role):
+    entry = db.session.execute(select(AccessEntry).where(
+        AccessEntry.target_type == "repository", AccessEntry.target_id.is_(None),
+        AccessEntry.principal_type == "role", AccessEntry.principal_id == role.id
+    )).scalar_one_or_none()
+    return {"name": role.name, "description": role.description, "capabilities": sorted(role.capability_set),
+            "repository_permissions": sorted(entry.permission_set) if entry else []}
 
 
 def _role_json(role):
@@ -1825,7 +2015,9 @@ def admin_create_role():
     if perms:
         db.session.add(AccessEntry(target_type="repository", target_id=None, principal_type="role",
                                    principal_id=role.id, permissions=parse_perms(perms)))
-    log_activity("admin", "role_saved", f"Role '{role.name}' created", role.id)
+    db.session.flush()
+    log_activity("admin", "role_saved", f"Role '{role.name}' created", role.id, entity_type="role",
+                 entity_name=role.name, changes=diff({}, _role_audit_snapshot(role)))
     db.session.commit()
     return jsonify(ok=True, role=_role_json(role)), 201
 
@@ -1848,6 +2040,7 @@ def admin_update_role(role_id):
     capabilities = data.getlist("capabilities") if "capabilities" in data else list(role.capability_set)
     if role.is_system and role.name == "Admin" and "admin" not in capabilities:
         raise ValidationError("The Admin role must keep the administration capability.")
+    before = _role_audit_snapshot(role)
     role.name = name
     role.description = (data.get("description", role.description) or "").strip()[:500]
     role.capabilities = ",".join(cap for cap in SYSTEM_CAPS if cap in capabilities)
@@ -1866,7 +2059,9 @@ def admin_update_role(role_id):
             entry.permissions = parse_perms(perms)
         elif entry is not None:
             db.session.delete(entry)
-    log_activity("admin", "role_saved", f"Role '{role.name}' updated", role.id)
+    db.session.flush()
+    log_activity("admin", "role_saved", f"Role '{role.name}' updated", role.id, entity_type="role",
+                 entity_name=role.name, changes=diff(before, _role_audit_snapshot(role)))
     db.session.commit()
     reset_resolver()
     return jsonify(ok=True, role=_role_json(role))
@@ -1881,12 +2076,15 @@ def admin_delete_role(role_id):
         raise NotFound("Role not found.")
     if role.is_system:
         raise ValidationError("Predefined roles cannot be deleted.")
+    before = _role_audit_snapshot(role)
+    role_id_deleted = role.id
     db.session.query(AccessEntry).filter(
         AccessEntry.principal_type == "role", AccessEntry.principal_id == role.id
     ).delete(synchronize_session=False)
     name = role.name
     db.session.delete(role)
-    log_activity("admin", "role_deleted", f"Role '{name}' deleted")
+    log_activity("admin", "role_deleted", f"Role '{name}' deleted", role_id_deleted, entity_type="role",
+                 entity_name=name, changes=diff(before, {}))
     db.session.commit()
     return jsonify(ok=True)
 
@@ -1932,8 +2130,11 @@ def admin_update_settings():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         raise ValidationError("Send the settings to change as a JSON object.")
+    before = settings.all_settings()
     settings.update_from_form(_settings_form(payload))
-    log_activity("admin", "settings_changed", "System settings updated through the API")
+    settings.clear_cache()
+    log_activity("admin", "settings_changed", "System settings updated through the API", entity_type="setting",
+                 changes=diff(before, settings.all_settings()))
     db.session.commit()
     settings.clear_cache()
     return jsonify(ok=True, settings=settings.all_settings())

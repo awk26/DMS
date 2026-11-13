@@ -452,17 +452,33 @@ class SearchEntry(db.Model):
 # --------------------------------------------------------------------------- activity
 
 class ActivityLog(db.Model):
+    """Audit log. Append-only: database triggers (database/procedures.sql, installed on start-up)
+    reject UPDATE and DELETE, and the ORM refuses to flush changes to existing rows."""
     __tablename__ = "activity_log"
+    __table_args__ = (Index("ix_activity_log_entity", "entity_type", "entity_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     category: Mapped[str] = mapped_column(String(20), nullable=False)  # document|folder|email|gmail|security|admin
     action: Mapped[str] = mapped_column(String(40), nullable=False)
     message: Mapped[str] = mapped_column(String(500), nullable=False)
     entity_id: Mapped[Optional[int]] = mapped_column(Integer)
+    # What entity_id refers to: document|folder|version|repository|user|role|email|setting (NULL on old rows)
+    entity_type: Mapped[Optional[str]] = mapped_column(String(20))
+    entity_name: Mapped[Optional[str]] = mapped_column(String(500))  # snapshot at event time
+    # JSON: {"changes": {field: {"old": .., "new": ..}}, ...other context}
+    details_json: Mapped[Optional[str]] = mapped_column(Text)
     user_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
     user_name: Mapped[Optional[str]] = mapped_column(String(200))
     ip: Mapped[Optional[str]] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False, index=True)
+
+    @property
+    def details(self):
+        try:
+            value = json.loads(self.details_json or "{}")
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
 
 
 # --------------------------------------------------------------------------- gmail
@@ -521,6 +537,8 @@ class ArchivedEmail(db.Model):
     scan_status: Mapped[str] = mapped_column(String(20), default="unscanned", nullable=False,
                                              server_default="unscanned")
     scan_detail: Mapped[Optional[str]] = mapped_column(String(300))
+    # When the images the body links to were downloaded (NULL = not yet tried). See EmailImage.
+    images_fetched_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     account: Mapped[GmailAccount] = relationship()
     attachments: Mapped[list["EmailAttachment"]] = relationship(
@@ -540,6 +558,24 @@ class EmailAttachment(db.Model):
     is_inline: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     email: Mapped[ArchivedEmail] = relationship(back_populates="attachments")
+
+
+class EmailImage(db.Model):
+    """A copy of an image an archived email links to (``<img src="https://...">``), downloaded once and
+    stored encrypted with the email so the preview never loads it from the internet. The .eml is unchanged."""
+    __tablename__ = "email_images"
+    __table_args__ = (UniqueConstraint("email_id", "url_hash", name="uq_email_image"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email_id: Mapped[int] = mapped_column(ForeignKey("archived_emails.id"), nullable=False, index=True)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    url_hash: Mapped[str] = mapped_column(String(64), nullable=False)   # sha256 of url
+    status: Mapped[str] = mapped_column(String(10), nullable=False)      # stored | failed
+    storage_key: Mapped[Optional[str]] = mapped_column(String(255))
+    content_type: Mapped[Optional[str]] = mapped_column(String(40))
+    size: Mapped[Optional[int]] = mapped_column(BigInteger)
+    error: Mapped[Optional[str]] = mapped_column(String(300))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class PendingImport(db.Model):

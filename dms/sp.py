@@ -69,6 +69,46 @@ def split_script(text):
     return [s for s in statements if s and not s.upper().startswith("USE ")]
 
 
+AUDIT_ROUTINES = ("sp_audit_log_add",)
+AUDIT_TRIGGERS = ("trg_activity_log_no_update", "trg_activity_log_no_delete")
+
+
+def audit_script():
+    """The statements between ``-- @audit-begin`` and ``-- @audit-end`` in procedures.sql."""
+    text = PROCEDURES_FILE.read_text(encoding="utf-8")
+    start = text.index("-- @audit-begin")
+    end = text.index("-- @audit-end")
+    block = text[text.index("\n", start) + 1:end]
+    return split_script("DELIMITER $$\n" + block)
+
+
+def ensure_audit_objects(connection):
+    """Create the audit procedure and the append-only triggers if they are missing.
+
+    Returns the names created. Needs CREATE ROUTINE and TRIGGER privileges; callers treat a
+    failure as a warning (the full script can be installed with `flask install-procedures`).
+    """
+    from sqlalchemy import text
+    have_routines = set(connection.execute(text(
+        "SELECT routine_name FROM information_schema.routines "
+        "WHERE routine_schema = DATABASE() AND routine_type = 'PROCEDURE'")).scalars())
+    have_triggers = set(connection.execute(text(
+        "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE()")).scalars())
+    missing = [n for n in AUDIT_ROUTINES if n not in have_routines] + \
+              [n for n in AUDIT_TRIGGERS if n not in have_triggers]
+    if not missing:
+        return []
+    raw = connection.connection.cursor()
+    try:
+        for sql in audit_script():
+            raw.execute(sql)
+            while raw.nextset():
+                pass
+    finally:
+        raw.close()
+    return missing
+
+
 def install_procedures():
     """(Re)create every procedure from database/procedures.sql. Returns the number of statements run."""
     statements = split_script(PROCEDURES_FILE.read_text(encoding="utf-8"))
