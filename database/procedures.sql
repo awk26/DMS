@@ -2,13 +2,13 @@
 -- DMS stored procedures (MySQL 8.0.19+). Python calls them through dms/sp.py.
 -- Install: `flask --app app install-procedures`, or in Workbench:
 --          SQL Editor tab -> paste -> Ctrl+Shift+Enter (Execute All)
--- Is script ko dobara chalana safe hai (DROP ... IF EXISTS).
+-- The script is safe to run again (DROP ... IF EXISTS).
 -- =====================================================================
 USE DMS;
 
 DELIMITER $$
 
--- ------------------------------------------------- extra indexes (sirf tab banenge jab na hon)
+-- ------------------------------------------------- extra indexes (created only when missing)
 DROP PROCEDURE IF EXISTS sp__add_index_if_missing$$
 CREATE PROCEDURE sp__add_index_if_missing(IN p_table VARCHAR(64), IN p_index VARCHAR(64), IN p_cols VARCHAR(255))
 BEGIN
@@ -27,8 +27,8 @@ CALL sp__add_index_if_missing('archived_emails', 'ix_archived_emails_account_imp
 DROP PROCEDURE IF EXISTS sp__add_index_if_missing$$
 
 
--- ------------------------------------------------- Gmail: har user ki apni mailbox (schema upgrade)
--- gmail_accounts.user_id = mailbox kis DMS user ki hai; token_enc = us user ka encrypted OAuth token.
+-- ------------------------------------------------- Gmail: one mailbox per user (schema upgrade)
+-- gmail_accounts.user_id = the DMS user who owns the mailbox; token_enc = that user's encrypted OAuth token.
 DROP PROCEDURE IF EXISTS sp__ddl_if_missing$$
 CREATE PROCEDURE sp__ddl_if_missing(IN p_kind VARCHAR(10), IN p_table VARCHAR(64), IN p_name VARCHAR(64),
                                     IN p_ddl TEXT)
@@ -62,8 +62,8 @@ CALL sp__ddl_if_missing('fk', 'gmail_accounts', 'fk_gmail_accounts_user',
   'ALTER TABLE gmail_accounts ADD CONSTRAINT fk_gmail_accounts_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL')$$
 DROP PROCEDURE IF EXISTS sp__ddl_if_missing$$
 
--- Jis mailbox ka koi maalik nahi (purana single-mailbox setup), wo na sync hogi na kisi ko dikhegi,
--- jab tak uska maalik DMS mein login karke wahi Gmail dobara connect na kare.
+-- A mailbox without an owner (old single-mailbox setup) is neither synced nor shown to anyone
+-- until its owner signs in to the DMS and connects the same Gmail account again.
 UPDATE gmail_accounts SET is_active = 0 WHERE user_id IS NULL$$
 
 
@@ -147,7 +147,7 @@ BEGIN
   IF v_username = '' THEN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Choose a user name.';
   END IF;
-  -- p_role_name NULL = koi role nahi
+  -- p_role_name NULL = no role
   IF p_role_name IS NOT NULL THEN
     SELECT id INTO v_role_id FROM roles WHERE name = p_role_name LIMIT 1;
     IF v_role_id IS NULL THEN
@@ -189,7 +189,7 @@ BEGIN
        p_user_id, p_user_id, v_label, p_ip);
 END$$
 
--- Threshold / minutes Python settings se bhejega (default 5 / 15)
+-- Python passes the threshold and minutes from the settings (default 5 / 15)
 DROP PROCEDURE IF EXISTS sp_user_login_failed$$
 CREATE PROCEDURE sp_user_login_failed(IN p_user_id INT, IN p_threshold INT, IN p_lock_minutes INT,
                                       IN p_ip VARCHAR(64))
@@ -335,7 +335,7 @@ BEGIN
   LIMIT p_limit OFFSET p_offset;
 END$$
 
--- Folder + saare subfolders + unke documents trash mein. Restore ke liye batch id lautata hai.
+-- Moves the folder, all its subfolders and their documents to the trash. Returns the batch id used to restore them.
 DROP PROCEDURE IF EXISTS sp_folder_soft_delete$$
 CREATE PROCEDURE sp_folder_soft_delete(IN p_folder_id INT, IN p_user_id INT, IN p_user_name VARCHAR(200))
 BEGIN
@@ -386,7 +386,7 @@ END$$
 
 
 -- ================================================================= 4. DOCUMENTS / VERSIONS
--- Python pehle file encrypt karke storage mein likhe, phir ye SP call kare.
+-- Python first encrypts the file and writes it to storage, then calls this procedure.
 DROP PROCEDURE IF EXISTS sp_document_create$$
 CREATE PROCEDURE sp_document_create(
   IN p_folder_id INT, IN p_name VARCHAR(255), IN p_extension VARCHAR(16), IN p_document_type_id INT,
@@ -401,7 +401,7 @@ proc: BEGIN
   DECLARE v_msg VARCHAR(500);
   DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
 
-  -- Same request dobara aaye (network retry) to wahi document lautao
+  -- The same request sent again (network retry) returns the same document
   IF p_idempotency_key IS NOT NULL THEN
     SELECT document_id, id INTO v_doc_id, v_ver_id
     FROM document_versions WHERE idempotency_key = p_idempotency_key LIMIT 1;
@@ -439,7 +439,7 @@ proc: BEGIN
   SELECT v_doc_id AS document_id, v_ver_id AS version_id, 0 AS was_duplicate;
 END$$
 
--- p_is_major = 1 -> 2.0 jaisa, 0 -> 1.1 jaisa
+-- p_is_major = 1 -> e.g. 2.0, 0 -> e.g. 1.1
 DROP PROCEDURE IF EXISTS sp_document_add_version$$
 CREATE PROCEDURE sp_document_add_version(
   IN p_document_id INT, IN p_is_major TINYINT, IN p_user_id INT, IN p_user_name VARCHAR(200),
@@ -465,7 +465,7 @@ proc: BEGIN
   END IF;
 
   START TRANSACTION;
-  -- Row lock: do log ek saath upload karein to version number nahi takrayega
+  -- Row lock: two people uploading at the same time cannot get the same version number
   SELECT name, checked_out_by_id INTO v_name, v_locked_by
   FROM documents WHERE id = p_document_id AND deleted_at IS NULL FOR UPDATE;
   IF v_name IS NULL THEN
@@ -544,7 +544,7 @@ BEGIN
   CALL sp_activity_log_add('document', 'checkout', 'Checked out', p_document_id, p_user_id, p_user_name, NULL);
 END$$
 
--- p_is_admin = 1 -> admin kisi aur ka lock bhi khol sakta hai
+-- p_is_admin = 1 -> an admin can also release another user's lock
 DROP PROCEDURE IF EXISTS sp_document_checkin$$
 CREATE PROCEDURE sp_document_checkin(IN p_document_id INT, IN p_user_id INT, IN p_is_admin TINYINT,
                                      IN p_user_name VARCHAR(200))
@@ -627,7 +627,7 @@ BEGIN
   DELETE FROM search_entries WHERE kind = p_kind AND ref_id = p_ref_id;
 END$$
 
--- p_kind NULL = sab, 'document' ya 'email'. Permission filter Python karega.
+-- p_kind NULL = all, 'document' or 'email'. Python applies the permission filter.
 DROP PROCEDURE IF EXISTS sp_search$$
 CREATE PROCEDURE sp_search(IN p_query VARCHAR(500), IN p_kind VARCHAR(10), IN p_limit INT, IN p_offset INT)
 BEGIN
@@ -642,7 +642,7 @@ END$$
 
 
 -- ================================================================= 7. FAVOURITES / RECENT
--- Har user ke sirf last 50 recent rakhta hai
+-- Keeps only the last 50 recent items per user
 DROP PROCEDURE IF EXISTS sp_recent_touch$$
 CREATE PROCEDURE sp_recent_touch(IN p_user_id INT, IN p_document_id INT)
 BEGIN
@@ -667,7 +667,7 @@ BEGIN
   LIMIT p_limit;
 END$$
 
--- Result: 1 = ab favourite hai, 0 = hata diya
+-- Result: 1 = now a favourite, 0 = removed
 DROP PROCEDURE IF EXISTS sp_favourite_toggle$$
 CREATE PROCEDURE sp_favourite_toggle(IN p_user_id INT, IN p_target_type VARCHAR(10), IN p_target_id INT)
 BEGIN
@@ -698,9 +698,9 @@ BEGIN
 END$$
 
 
--- ================================================================= 9. GMAIL (har user ki apni mailbox)
--- Har user sirf apni connect ki hui mailbox ki emails dekh sakta hai; admin ko bhi doosron ki
--- emails nahi dikhti, sirf mailbox ka sync status (sp_gmail_accounts_admin_list).
+-- ================================================================= 9. GMAIL (one mailbox per user)
+-- Each user sees only the emails of the mailbox they connected; an admin does not see other users'
+-- emails either, only each mailbox's sync status (sp_gmail_accounts_admin_list).
 
 DROP PROCEDURE IF EXISTS sp_gmail_account_connect$$
 CREATE PROCEDURE sp_gmail_account_connect(
@@ -721,7 +721,7 @@ BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'This Gmail account is already connected by another DMS user.';
   END IF;
 
-  -- Ek user ki ek hi mailbox sync hoti hai. Pehle wali band hoti hai, par uski emails usi user ki rehti hain.
+  -- Only one mailbox per user is synced. The previous one is deactivated, but its emails stay with the same user.
   UPDATE gmail_accounts
      SET is_active = 0, token_enc = NULL, last_sync_status = 'disconnected'
    WHERE user_id = p_user_id AND is_active = 1 AND email <> v_email;
@@ -732,7 +732,7 @@ BEGIN
     VALUES (v_email, p_user_id, p_token_enc, NULL, 1, UTC_TIMESTAMP(6), 'never', 1);
     SET v_id = LAST_INSERT_ID();
   ELSE
-    -- Wahi mailbox dobara connect hui: history_id rehta hai, sync wahin se aage chalega.
+    -- The same mailbox was connected again: history_id is kept, so sync continues from where it stopped.
     UPDATE gmail_accounts
        SET user_id = p_user_id, token_enc = p_token_enc, is_active = 1, connected_at = UTC_TIMESTAMP(6),
            last_sync_status = IF(history_id IS NULL, 'never', 'connected'), last_error = NULL,
@@ -752,7 +752,7 @@ BEGIN
   DECLARE v_emails VARCHAR(2000) DEFAULT NULL;
   SELECT COUNT(*), GROUP_CONCAT(email ORDER BY id SEPARATOR ', ') INTO v_count, v_emails
     FROM gmail_accounts WHERE user_id = p_user_id AND is_active = 1;
-  -- Token hat jaata hai; archived emails DMS mein usi user ki rehti hain.
+  -- The token is removed; archived emails stay in the DMS with the same user.
   UPDATE gmail_accounts SET is_active = 0, token_enc = NULL, last_sync_status = 'disconnected'
    WHERE user_id = p_user_id AND is_active = 1;
   IF v_count > 0 THEN
@@ -765,7 +765,7 @@ END$$
 DROP PROCEDURE IF EXISTS sp_gmail_account_save_token$$
 CREATE PROCEDURE sp_gmail_account_save_token(IN p_account_id INT, IN p_token_enc TEXT)
 BEGIN
-  -- Refresh ke baad naya token. Beech mein disconnect hua ho to token wapas nahi likha jaata.
+  -- New token after a refresh. If the mailbox was disconnected in the meantime, the token is not written back.
   UPDATE gmail_accounts SET token_enc = p_token_enc
    WHERE id = p_account_id AND is_active = 1 AND token_enc IS NOT NULL;
 END$$
@@ -773,8 +773,8 @@ END$$
 DROP PROCEDURE IF EXISTS sp_gmail_accounts_due$$
 CREATE PROCEDURE sp_gmail_accounts_due(IN p_limit INT)
 BEGIN
-  -- Sync ke liye taiyaar mailboxes, jo sabse pehle sync hui thi wo pehle.
-  -- reauth_required wali tab tak ruki rehti hain jab tak user dobara connect na kare.
+  -- Mailboxes ready to sync, the one synced longest ago first.
+  -- Mailboxes marked reauth_required wait until the user connects them again.
   SELECT id FROM gmail_accounts
   WHERE is_active = 1 AND user_id IS NOT NULL AND token_enc IS NOT NULL
     AND last_sync_status <> 'reauth_required'
@@ -786,7 +786,7 @@ END$$
 DROP PROCEDURE IF EXISTS sp_gmail_status_for_user$$
 CREATE PROCEDURE sp_gmail_status_for_user(IN p_user_id INT)
 BEGIN
-  -- User ki mailbox (chalu wali, warna sabse nayi) aur uski apni emails ki ginti.
+  -- The user's mailbox (the active one, otherwise the newest) and the count of the user's own emails.
   SELECT a.id AS account_id, a.email, a.is_active, a.connected_at, a.last_sync_at, a.last_success_at,
          a.last_sync_status, a.last_error,
          (SELECT COUNT(*) FROM pending_imports p WHERE p.account_id = a.id AND p.status = 'pending') AS pending,
@@ -802,7 +802,7 @@ END$$
 DROP PROCEDURE IF EXISTS sp_gmail_accounts_admin_list$$
 CREATE PROCEDURE sp_gmail_accounts_admin_list(IN p_limit INT, IN p_offset INT)
 BEGIN
-  -- Admin ke liye sirf mailbox ka haal (kaun, kab sync, errors). Email ka content yahan nahi aata.
+  -- For admins: mailbox status only (owner, last sync, errors). No email content is returned here.
   SELECT a.id AS account_id, a.email, a.user_id, u.username, a.is_active, a.connected_at, a.last_sync_at,
          a.last_success_at, a.last_sync_status, a.last_error,
          (SELECT COUNT(*) FROM archived_emails e WHERE e.account_id = a.id) AS archived_total,
@@ -818,7 +818,7 @@ END$$
 DROP PROCEDURE IF EXISTS sp_gmail_retry_failed$$
 CREATE PROCEDURE sp_gmail_retry_failed(IN p_user_id INT)
 BEGIN
-  -- p_user_id NULL = sabki mailboxes (admin); warna sirf us user ki.
+  -- p_user_id NULL = all mailboxes (admin); otherwise only that user's.
   UPDATE pending_imports p
     JOIN gmail_accounts a ON a.id = p.account_id
      SET p.status = 'pending', p.attempts = 0
@@ -831,7 +831,7 @@ CREATE PROCEDURE sp_email_list(
   IN p_user_id INT, IN p_q VARCHAR(200), IN p_state VARCHAR(20), IN p_with_attachments TINYINT,
   IN p_sort VARCHAR(20), IN p_limit INT, IN p_offset INT)
 BEGIN
-  -- Sirf p_user_id ki apni mailboxes ki emails. Har row: total + us page ki email id (khali page par id NULL).
+  -- Only emails from p_user_id's own mailboxes. Each row: total + an email id on that page (id is NULL on an empty page).
   DECLARE v_q    VARCHAR(200) DEFAULT TRIM(COALESCE(p_q, ''));
   DECLARE v_like VARCHAR(210) DEFAULT CONCAT('%', TRIM(COALESCE(p_q, '')), '%');
   DECLARE v_sort VARCHAR(20)  DEFAULT COALESCE(p_sort, 'imported');
@@ -862,7 +862,7 @@ END$$
 DROP PROCEDURE IF EXISTS sp_email_get_owned$$
 CREATE PROCEDURE sp_email_get_owned(IN p_user_id INT, IN p_email_id INT)
 BEGIN
-  -- Email tabhi milti hai jab wo p_user_id ki apni mailbox ki ho.
+  -- The email is returned only when it belongs to one of p_user_id's own mailboxes.
   SELECT e.id
   FROM archived_emails e
   JOIN gmail_accounts a ON a.id = e.account_id
@@ -871,7 +871,7 @@ END$$
 
 DELIMITER ;
 
--- ================================================================= CHECK: 36 aane chahiye
+-- ================================================================= CHECK: should return 38
 SELECT COUNT(*) AS total_procedures
 FROM information_schema.routines
 WHERE routine_schema = 'DMS' AND routine_type = 'PROCEDURE';

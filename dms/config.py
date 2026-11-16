@@ -43,6 +43,18 @@ def _str(name, default=""):
     return os.environ.get(name, default).strip()
 
 
+# Default Content-Security-Policy for the app and API: everything from this origin only, no inline
+# scripts, no plugins, no framing by other sites. data:/blob: images are used by previews and email
+# bodies; Google is allowed as a form target for the Gmail OAuth hand-off.
+DEFAULT_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; img-src 'self' data: blob:; media-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "script-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; "
+    "form-action 'self' https://accounts.google.com; frame-ancestors 'self'"
+)
+# Browser features the app never uses are switched off.
+DEFAULT_PERMISSIONS_POLICY = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+
+
 def database_uri():
     """The MySQL connection URL.
 
@@ -115,6 +127,17 @@ class Config:
     SSL_KEY_FILE = _path("DMS_SSL_KEY_FILE", None)
     # Number of reverse proxies in front of the app whose X-Forwarded-* headers are trusted.
     TRUSTED_PROXIES = _int("DMS_TRUSTED_PROXIES", 0)
+
+    # Security response headers, added to every Flask response (VAPT: CSP, clickjacking, MIME sniffing,
+    # server version). Routes that need a different policy (document previews, rendered files, email
+    # bodies) set their own Content-Security-Policy, which takes precedence. Keep these values in line
+    # with the frontend's web server config (DMS-FE/deploy/nginx-dms.conf), which serves the React app.
+    CONTENT_SECURITY_POLICY = _str("DMS_CONTENT_SECURITY_POLICY", DEFAULT_CONTENT_SECURITY_POLICY)
+    FRAME_OPTIONS = _str("DMS_FRAME_OPTIONS", "SAMEORIGIN")
+    REFERRER_POLICY = _str("DMS_REFERRER_POLICY", "same-origin")
+    PERMISSIONS_POLICY = _str("DMS_PERMISSIONS_POLICY", DEFAULT_PERMISSIONS_POLICY)
+    # "Server" header sent by `python app.py` instead of "Werkzeug/3.x Python/3.x", so no version is disclosed.
+    SERVER_HEADER = _str("DMS_SERVER_HEADER", "DMS")
 
     # Encryption at rest (AES-256-GCM). Keys: DMS_MASTER_KEYS / DMS_MASTER_KEY_FILE / DMS_KEY_PROVIDER.
     ENCRYPTION_AT_REST = _bool("DMS_ENCRYPTION_AT_REST", True)

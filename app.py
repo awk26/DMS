@@ -9,9 +9,19 @@ In production, run behind a TLS-terminating reverse proxy or a WSGI server such 
 import os
 import ssl
 
+from werkzeug.serving import WSGIRequestHandler
+
 from dms import create_app, ensure_maintenance, ensure_scheduler
 
 app = create_app()
+
+
+class RequestHandler(WSGIRequestHandler):
+    """Sends a generic "Server" header (config SERVER_HEADER) instead of the Werkzeug and Python
+    versions, which a security scan reports as information disclosure."""
+
+    def version_string(self):
+        return app.config.get("SERVER_HEADER") or "DMS"
 
 
 def tls_context():
@@ -28,4 +38,4 @@ if __name__ == "__main__":
     ensure_scheduler(app)  # start Gmail synchronization immediately, not on first request
     ensure_maintenance(app)
     app.run(host=os.environ.get("DMS_HOST", "127.0.0.1"), port=int(os.environ.get("DMS_PORT", "5000")),
-            debug=False, threaded=True, ssl_context=tls_context())
+            debug=False, threaded=True, ssl_context=tls_context(), request_handler=RequestHandler)

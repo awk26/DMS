@@ -168,16 +168,23 @@ def _register_error_handlers(app):
 
 
 def _register_security_headers(app):
-    default_csp = ("default-src 'self'; img-src 'self' data: blob:; media-src 'self'; style-src 'self' 'unsafe-inline'; "
-                   "script-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; "
-                   "form-action 'self' https://accounts.google.com; frame-ancestors 'self'")
+    """Security headers on every response; values come from config.py (DMS_* environment variables).
+    setdefault keeps any stricter or route-specific header a view already set."""
+    from .config import DEFAULT_CONTENT_SECURITY_POLICY
+    cfg = app.config
+    defaults = {
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": cfg.get("REFERRER_POLICY") or "same-origin",
+        "X-Frame-Options": cfg.get("FRAME_OPTIONS") or "SAMEORIGIN",
+        "Content-Security-Policy": cfg.get("CONTENT_SECURITY_POLICY") or DEFAULT_CONTENT_SECURITY_POLICY,
+        "Permissions-Policy": cfg.get("PERMISSIONS_POLICY") or "",
+    }
+    defaults = {name: value for name, value in defaults.items() if value}
 
     @app.after_request
     def headers(resp):
-        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-        resp.headers.setdefault("Referrer-Policy", "same-origin")
-        resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
-        resp.headers.setdefault("Content-Security-Policy", default_csp)
+        for name, value in defaults.items():
+            resp.headers.setdefault(name, value)
         if request.endpoint:
             resp.headers.setdefault("Cache-Control", "no-store")
         return resp
