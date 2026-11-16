@@ -15,6 +15,7 @@ def _defaults():
         # Repository & recycle bin
         "recycle_bin_days": 30,               # at least 30: deleted items stay restorable for a month
         "home_container_folder_id": None,     # hidden folder that holds every user's "My Files"
+        "restricted_repository_migrated": False,  # upgrade: role repository grants moved to top-level content
         "folder_name_pattern": "",            # optional regex every folder name must match
         "document_name_pattern": "",          # optional regex every document name must match
         "name_max_length": 200,
@@ -37,7 +38,6 @@ def _defaults():
         "device_policy": "any",               # any | approval (new devices need administrator approval)
         "blocked_platforms": [],              # e.g. ["android", "ios"]
         "self_signup": True,                  # anyone who can reach the sign-in page may create an account
-        "signup_default_role": "Contributor",
         "sso_auto_provision": True,
         "sso_default_role": "Reader",
         "group_role_map": {},                 # {"DMS-Admins": "Admin"}
@@ -189,7 +189,6 @@ def update_from_form(form):
         "device_policy": device_policy,
         "blocked_platforms": platforms,
         "self_signup": form.get("self_signup") == "1",
-        "signup_default_role": (form.get("signup_default_role") or "Contributor").strip(),
         "sso_auto_provision": form.get("sso_auto_provision") == "1",
         "sso_default_role": (form.get("sso_default_role") or "Reader").strip(),
         "group_role_map": group_map,

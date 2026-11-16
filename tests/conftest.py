@@ -138,6 +138,25 @@ def make_user(username, roles=("Admin",), password="Correct-Horse-9", **kw):
     return user
 
 
+def open_repository(*role_names):
+    """Give roles back their repository-wide access from before "restricted by default"
+    (an administrator can still configure this on purpose). Defaults to Contributor, Reader, Auditor."""
+    from dms.models import AccessEntry, Role
+    from dms.security.permissions import LEGACY_REPOSITORY_PERMS, parse_perms, reset_resolver
+    for name in role_names or LEGACY_REPOSITORY_PERMS:
+        role = db.session.query(Role).filter_by(name=name).one()
+        db.session.add(AccessEntry(target_type="repository", target_id=None, principal_type="role",
+                                   principal_id=role.id, permissions=parse_perms(LEGACY_REPOSITORY_PERMS[name])))
+    db.session.commit()
+    reset_resolver()
+
+
+@pytest.fixture
+def legacy_repository(app):
+    """For tests written before "restricted by default": roles get repository-wide access again."""
+    open_repository()
+
+
 def login_as(client, user):
     """Start an authenticated session for ``user`` (first factor + MFA done, approved device)."""
     import time

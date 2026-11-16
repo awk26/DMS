@@ -104,6 +104,56 @@ def _admin_owner_grants():
         log.info("Privacy upgrade: added %s owner grant(s) for administrators' own items", added)
 
 
+def _restricted_repository():
+    """Restricted by default: Contributor, Reader and Auditor lose their repository-wide grants.
+
+    So that nobody loses access to what they can open today, each role's old repository grant is
+    copied onto every existing top-level Shared library folder and root document that inherits from
+    the repository (including items in the recycle bin, so a restore keeps them). The personal-files
+    container never inherits, so My Files are untouched. Runs once (a setting records it), so an
+    administrator may later give a role repository access again on purpose.
+    """
+    from .models import AccessEntry, Document, Folder, Role
+    from .security.permissions import LEGACY_REPOSITORY_PERMS, parse_perms
+    from .services import settings
+    if settings.get("restricted_repository_migrated"):
+        return
+    home_container = settings.get("home_container_folder_id")
+    folder_ids = [fid for fid in db.session.execute(select(Folder.id).where(
+        Folder.parent_id.is_(None), Folder.inherit_permissions.is_(True))).scalars() if fid != home_container]
+    doc_ids = list(db.session.execute(select(Document.id).where(
+        Document.folder_id.is_(None), Document.inherit_permissions.is_(True))).scalars())
+    moved = []
+    for name in LEGACY_REPOSITORY_PERMS:
+        role = db.session.execute(select(Role).where(Role.name == name)).scalar_one_or_none()
+        if role is None:
+            continue
+        entry = db.session.execute(select(AccessEntry).where(
+            AccessEntry.target_type == "repository", AccessEntry.target_id.is_(None),
+            AccessEntry.principal_type == "role", AccessEntry.principal_id == role.id)).scalar_one_or_none()
+        if entry is None:
+            continue
+        perms = entry.permission_set
+        have = {(t, i): e for t, i, e in (
+            (e.target_type, e.target_id, e) for e in db.session.execute(select(AccessEntry).where(
+                AccessEntry.principal_type == "role", AccessEntry.principal_id == role.id)).scalars())}
+        for ttype, ids in (("folder", folder_ids), ("document", doc_ids)):
+            for oid in ids:
+                existing = have.get((ttype, oid))
+                if existing is not None:
+                    existing.permissions = parse_perms(existing.permission_set | perms)
+                else:
+                    db.session.add(AccessEntry(target_type=ttype, target_id=oid, principal_type="role",
+                                               principal_id=role.id, permissions=parse_perms(perms)))
+        db.session.delete(entry)
+        moved.append(name)
+    settings.set_value("restricted_repository_migrated", True)
+    db.session.commit()
+    if moved:
+        log.info("Restricted repository: moved repository-wide access of %s onto %s top-level folder(s) and "
+                 "%s root document(s)", ", ".join(moved), len(folder_ids), len(doc_ids))
+
+
 def upgrade(app):
     from .security.auth import ensure_predefined_roles
     from .services import search
@@ -113,6 +163,7 @@ def upgrade(app):
     _backfill()
     ensure_predefined_roles()
     _admin_owner_grants()
+    _restricted_repository()
     # Index existing content the first time search is available.
     from .models import ArchivedEmail, Document, SearchEntry
     if db.session.query(SearchEntry.id).first() is None and (

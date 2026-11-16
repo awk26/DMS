@@ -7,6 +7,10 @@ from dms.services.folders import ensure_home
 from .conftest import PDF, Api, make_user
 
 
+# Written before "restricted by default": Contributor/Reader/Auditor keep repository-wide access here.
+pytestmark = pytest.mark.usefixtures("legacy_repository")
+
+
 @pytest.fixture
 def alice(app, admin):
     return Api(app, make_user("alice", ("Contributor",), email="alice@example.com", display_name="Alice"))
@@ -83,7 +87,8 @@ def test_shared_by_me_lists_items_with_recipients_and_counts(app, alice, bob):
     rows = {(r["type"], r["id"]): r for r in sent["shared_by_me"]}
     assert sorted((p["name"], p["level"]) for p in rows[("document", doc)]["shared_with"]) == \
         [("Bob", "view"), ("Carol", "edit")]
-    assert rows[("folder", folder)]["shared_with"] == [{"id": bob.user.id, "name": "Bob", "level": "download"}]
+    assert rows[("folder", folder)]["shared_with"] == [{"id": bob.user.id, "name": "Bob", "level": "download",
+                                                    "expires_at": None}]
 
     # Items in the recycle bin drop out of both lists.
     assert alice.delete(f"/documents/{doc}").status_code == 200

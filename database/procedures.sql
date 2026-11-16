@@ -92,6 +92,20 @@ BEGIN
           LEFT(p_entity_name, 500), p_details, p_user_id, p_user_name, p_ip, UTC_TIMESTAMP(6));
 END$$
 
+-- Same as sp_audit_log_add plus the outcome (success | denied | failed). Used by dms/services/activity.py.
+DROP PROCEDURE IF EXISTS sp_audit_log_add_v2$$
+CREATE PROCEDURE sp_audit_log_add_v2(
+  IN p_category VARCHAR(20), IN p_action VARCHAR(40), IN p_message VARCHAR(500),
+  IN p_entity_type VARCHAR(20), IN p_entity_id INT, IN p_entity_name VARCHAR(500), IN p_details TEXT,
+  IN p_user_id INT, IN p_user_name VARCHAR(200), IN p_ip VARCHAR(64), IN p_status VARCHAR(10))
+BEGIN
+  INSERT INTO activity_log (category, action, message, entity_type, entity_id, entity_name, details_json,
+                            user_id, user_name, ip, created_at, status)
+  VALUES (p_category, p_action, COALESCE(LEFT(p_message, 500), ''), p_entity_type, p_entity_id,
+          LEFT(p_entity_name, 500), p_details, p_user_id, p_user_name, p_ip, UTC_TIMESTAMP(6),
+          COALESCE(p_status, 'success'));
+END$$
+
 -- The audit log is append-only: existing entries can never be changed or removed.
 DROP TRIGGER IF EXISTS trg_activity_log_no_update$$
 CREATE TRIGGER trg_activity_log_no_update BEFORE UPDATE ON activity_log FOR EACH ROW

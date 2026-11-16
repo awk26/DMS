@@ -1,19 +1,22 @@
 """Managing permissions on the repository, folders, documents and versions."""
+from datetime import date, datetime, time, timezone
+
 from sqlalchemy import select
 
 from ..extensions import db
-from ..models import AccessEntry, Document, DocumentVersion, Folder, Role, User
+from ..models import AccessEntry, Document, DocumentVersion, Folder, Role, User, utcnow
 from ..security.permissions import CONTENT_PERMS, normalize, parse_perms, reset_resolver
 from ..validation import ValidationError
 from .activity import log_activity
 from .folders import NotFound
 
 TARGET_TYPES = ("repository", "folder", "document", "version")
-SHAREABLE = ("view", "download", "edit")
+SHAREABLE = ("view", "upload", "download", "edit")
 # Simple access levels offered by the Share dialog, lowest first.
 SHARE_LEVELS = {
     "view": ("Can view", {"view"}),
     "download": ("Can view & download", {"view", "download"}),
+    "upload": ("Can add files", {"view", "download", "upload"}),
     "edit": ("Can edit", {"view", "download", "edit"}),
     "full": ("Full control", {"manage"}),
 }
@@ -22,10 +25,39 @@ SHARE_LEVELS = {
 def level_of(perms):
     """The Share-dialog level that best describes a permission set (None if it grants nothing)."""
     perms = normalize(perms)
-    for key in ("full", "edit", "download", "view"):
+    for key in ("full", "edit", "upload", "download", "view"):
         if normalize(SHARE_LEVELS[key][1]) <= perms:
             return key
     return None
+
+
+def parse_expiry(value):
+    """``expires_at`` from a request: '' / None = no end, 'YYYY-MM-DD' = access until the end of that
+    day (UTC), or an ISO date-time. Returns a naive UTC datetime; it must lie in the future."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, date):
+        moment = datetime.combine(value, time(23, 59, 59))
+    else:
+        text = str(value).strip()
+        try:
+            if len(text) == 10:
+                moment = datetime.combine(date.fromisoformat(text), time(23, 59, 59))
+            else:
+                moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValidationError("Enter the end of access as a date (YYYY-MM-DD).")
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    if moment <= utcnow():
+        raise ValidationError("The end of access must be in the future.")
+    return moment
+
+
+def iso(moment):
+    return moment.isoformat() + "Z" if moment else None
 
 
 def grant_owner(obj, user):
@@ -139,10 +171,12 @@ def _resolve_principal(principal_type, principal_id):
     return p
 
 
-def set_entry(obj, principal_type, principal_id, perms, actor=None, audit_action=None, level=None):
+def set_entry(obj, principal_type, principal_id, perms, actor=None, audit_action=None, level=None,
+              expires_at=None):
     """Create or replace the grant for one principal on obj. Empty perms removes the grant.
 
     ``audit_action`` overrides the audit action name (e.g. "shared" from the Share dialog).
+    ``expires_at`` (naive UTC, None = no end) is when the grant stops counting.
     """
     p = _resolve_principal(principal_type, principal_id)
     ttype, tid = target_key(obj)
@@ -152,8 +186,10 @@ def set_entry(obj, principal_type, principal_id, perms, actor=None, audit_action
     q = q.where(AccessEntry.target_id.is_(None) if tid is None else AccessEntry.target_id == tid)
     entry = db.session.execute(q).scalar_one_or_none()
     name = p.label if isinstance(p, User) else f"role {p.name}"
-    old_perms = entry.permission_set if entry is not None else set()
+    old_perms = entry.permission_set if entry is not None and not entry.is_expired else set()
     extra = {"level": level} if level else {}
+    if perms and (expires_at is not None or (entry is not None and entry.expires_at is not None)):
+        extra["expires_at"] = iso(expires_at)
     if not perms:
         if entry is not None:
             db.session.delete(entry)
@@ -165,8 +201,10 @@ def set_entry(obj, principal_type, principal_id, perms, actor=None, audit_action
                                 principal_id=p.id, created_by_id=actor.id if actor else None)
             db.session.add(entry)
         entry.permissions = parse_perms(perms)
+        entry.expires_at = expires_at
         _audit_permission(obj, audit_action or "permission_set",
-                          f"{target_label(obj)}: {name} granted {', '.join(p_ for p_ in CONTENT_PERMS if p_ in perms)}",
+                          f"{target_label(obj)}: {name} granted {', '.join(p_ for p_ in CONTENT_PERMS if p_ in perms)}"
+                          + (f" until {expires_at:%Y-%m-%d %H:%M} UTC" if expires_at else ""),
                           principal_type, p.id, name, old_perms, perms, **extra)
     db.session.commit()
     reset_resolver()
@@ -186,36 +224,41 @@ def remove_entry(obj, entry_id):
     reset_resolver()
 
 
-def share_level(obj, actor_perms, user_id, level, actor):
-    """Give one user a Share-dialog access level on obj.
+def share_level(obj, actor_perms, principal_id, level, actor, principal_type="user", expires_at=None):
+    """Give one user, or a role (group / department), a Share-dialog access level on obj.
 
     Users who manage the item set the level exactly (it can also be lowered). Users who
-    may only share can add view/download/edit up to their own access.
+    may only share can add view/upload/download/edit up to their own access.
     """
     if level not in SHARE_LEVELS:
         raise ValidationError("Choose what the person can do.")
-    if actor is not None and int(user_id) == actor.id:
+    if principal_type == "user" and actor is not None and int(principal_id) == actor.id:
         raise ValidationError("You cannot change your own access.")
     perms = SHARE_LEVELS[level][1]
     if "manage" in actor_perms:
-        set_entry(obj, "user", user_id, perms, actor, audit_action="shared", level=level)
+        set_entry(obj, principal_type, principal_id, perms, actor, audit_action="shared", level=level,
+                  expires_at=expires_at)
     elif level == "full":
         raise ValidationError("Only people with full control can give full control.")
     else:
-        share(obj, actor_perms, "user", user_id, perms, actor, level=level)
+        share(obj, actor_perms, principal_type, principal_id, perms, actor, level=level, expires_at=expires_at)
 
 
-def share(obj, actor_perms, principal_type, principal_id, perms, actor, level=None):
-    """Share = grant view/download/edit, limited to what the sharer has."""
+def share(obj, actor_perms, principal_type, principal_id, perms, actor, level=None, expires_at=None):
+    """Share = grant view/upload/download/edit, limited to what the sharer has."""
     perms = {p for p in perms if p in SHAREABLE}
     if not perms:
         raise ValidationError("Choose at least one permission to share.")
-    if not perms <= actor_perms:
+    if not normalize(perms) <= actor_perms:
         raise ValidationError("You can only share permissions you have yourself.")
     existing = set()
     for e in entries_for(obj):
-        if e.principal_type == principal_type and str(e.principal_id) == str(principal_id):
+        if e.principal_type == principal_type and str(e.principal_id) == str(principal_id) \
+                and not e.is_expired:
             existing = e.permission_set
+            if e.expires_at is None:
+                # Only managers may put an end date on access someone already has without one.
+                expires_at = None
     if principal_type == "user":
         # A personal grant is the user's exact access to the item (see security/permissions.py), so
         # someone who may only share must never lower what the person already has: keep their
@@ -226,7 +269,8 @@ def share(obj, actor_perms, principal_type, principal_id, perms, actor, level=No
         if perms <= current:
             return  # nothing to add
         existing |= current
-    set_entry(obj, principal_type, principal_id, existing | perms, actor, audit_action="shared", level=level)
+    set_entry(obj, principal_type, principal_id, existing | perms, actor, audit_action="shared", level=level,
+              expires_at=expires_at)
 
 
 def set_inheritance(obj, inherit, copy_inherited=True, actor=None):
@@ -253,23 +297,34 @@ def set_inheritance(obj, inherit, copy_inherited=True, actor=None):
             db.session.flush()
     if not inherit and copy_inherited:
         own = {(e.principal_type, e.principal_id): e for e in entries_for(obj)}
-        merged = {}
+        merged, ends = {}, {}
         node = parent_of(obj)
         while True:
             node_obj = None if node == "top" else node
             for e in entries_for(node_obj):
-                merged.setdefault((e.principal_type, e.principal_id), set()).update(e.permission_set)
+                if e.is_expired:
+                    continue
+                key = (e.principal_type, e.principal_id)
+                merged.setdefault(key, set()).update(e.permission_set)
+                # The copy ends when the last copied grant would have ended (never, if one has no end).
+                if key not in ends or (ends[key] is not None and (e.expires_at is None or e.expires_at > ends[key])):
+                    ends[key] = e.expires_at
             if node == "top" or node is None or not node.inherit_permissions:
                 break
             node = parent_of(node)
         ttype, tid = target_key(obj)
         for key, perms in merged.items():
-            if key in own:
+            if key in own and not own[key].is_expired:
                 own[key].permissions = parse_perms(own[key].permission_set | perms)
+                if own[key].expires_at is not None and (ends[key] is None or ends[key] > own[key].expires_at):
+                    own[key].expires_at = ends[key]
+            elif key in own:
+                own[key].permissions = parse_perms(perms)
+                own[key].expires_at = ends[key]
             else:
                 db.session.add(AccessEntry(target_type=ttype, target_id=tid, principal_type=key[0],
                                            principal_id=key[1], permissions=parse_perms(perms),
-                                           created_by_id=actor.id if actor else None))
+                                           created_by_id=actor.id if actor else None, expires_at=ends[key]))
             copied.append({"principal_type": key[0], "principal_id": key[1], "permissions": _ordered(perms)})
     old_inherit = bool(obj.inherit_permissions)
     obj.inherit_permissions = bool(inherit)

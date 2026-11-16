@@ -15,6 +15,10 @@ from dms.storage import get_storage
 
 from .conftest import PDF, PNG, Api, make_user
 
+# Written before "restricted by default": Contributor/Reader/Auditor keep repository-wide access here.
+pytestmark = pytest.mark.usefixtures("legacy_repository")
+
+
 EICAR = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 
 

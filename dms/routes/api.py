@@ -234,7 +234,7 @@ def login():
                     db.session.flush()
                     method = "ldap"
         if user is None:
-            log_activity("security", "login_failed", f"Failed sign-in for '{username[:100]}'")
+            log_activity("security", "login_failed", f"Failed sign-in for '{username[:100]}'", status="failed")
             db.session.commit()
             return jsonify(ok=False, error="The user name or password is incorrect.",
                            code="invalid_credentials"), 401
@@ -398,13 +398,11 @@ def register():
     if password != (data.get("password2") or ""):
         raise ValidationError("The passwords do not match.")
     check_password_policy(password)
-    from ..security.auth import role_by_name
-    role = role_by_name(settings.get("signup_default_role")) or role_by_name("Contributor")
-    if role and role.capability_set & {"admin", "records"}:
-        role = role_by_name("Contributor")
+    # Restricted by default: a self-registered account gets no role. It has its own My Files and what
+    # others share with it; an administrator adds it to roles (departments) for Shared library access.
     # sp_user_create also rejects a user name or email that is already taken.
     user_id = sp.call_one("sp_user_create", username, email, display_name, hash_password(password), "local",
-                          role.name if role else None)["user_id"]
+                          None)["user_id"]
     log_activity("security", "signup", f"'{username}' created an account", user_id)
     db.session.commit()
     user = db.session.get(User, user_id)
@@ -425,7 +423,10 @@ def register():
 
 def _need(perm, obj):
     if not resolver().can(perm, obj):
-        if obj is not None and not resolver().can("view", obj):
+        from ..services.activity import log_denied
+        can_view = obj is None or resolver().can("view", obj)
+        log_denied(perm, obj, can_view)  # kept although the request fails; only this user sees it
+        if not can_view:
             abort(404)
         abort(403)
 
@@ -580,7 +581,7 @@ def folders():
 def new_folder():
     data = _body()
     parent = get_folder(data.get("parent_id"))
-    _need("edit", parent)
+    _need("upload", parent)
     folder = create_folder(data.get("name", ""), parent, g.user)
     return jsonify(ok=True, folder=_folder_json(folder)), 201
 
@@ -631,7 +632,7 @@ def update_folder(folder_id):
     if "parent_id" in data:
         _need("delete", folder)
         destination = get_folder(data.get("parent_id"))
-        _need("edit", destination)
+        _need("upload", destination)
         # Moving takes everything out of its current place, exactly like delete: check the whole subtree.
         ensure_can_remove_subtree(subtree(folder), resolver(), "move")
         move_folder(folder, destination)
@@ -645,7 +646,7 @@ def copy_folder_api(folder_id):
     folder = get_folder(folder_id)
     _need("download", folder)
     destination = get_folder(data.get("parent_id"))
-    _need("edit", destination)
+    _need("upload", destination)
     report = {}
     copied = copy_folder(folder, destination, g.user, res=resolver(), report=report)
     # skipped = items inside the folder that the user may not read, which were left out.
@@ -795,7 +796,8 @@ def documents():
 def document(doc_id):
     doc = svc.get_document(doc_id)
     _need("view", doc)
-    svc.record_view(doc, g.user)  # feeds /recent (FR-FLD-04)
+    log_activity("document", "viewed", f"Opened '{doc.name}'", doc.id, entity_name=doc.name)
+    svc.record_view(doc, g.user)  # feeds /recent (FR-FLD-04); commits the audit entry too
     cv = doc.current_version
     kind = preview_kind(doc.extension)
     # Only shortcuts in folders the user may see: the others' folder paths are not theirs to know.
@@ -819,8 +821,14 @@ def content(doc_id):
     raw_number = request.args.get("version")
     number = _integer(raw_number, "version", 1) if raw_number else None
     version = svc.get_version(doc, number) if number else doc.current_version
+    if version is not None and "download" not in resolver().version(version):
+        from ..services.activity import log_denied
+        log_denied("download", version, "view" in resolver().version(version))
     if version is None or "download" not in resolver().version(version):
         abort(403)
+    log_activity("document", "downloaded", f"Downloaded '{doc.name}' (version {version.label})", doc.id,
+                 entity_name=doc.name, details={"version": version.label})
+    db.session.commit()
     return stream_stored(version.storage_key, version.mime_type, doc.name, as_attachment=True, etag=version.sha256)
 
 
@@ -840,6 +848,8 @@ def _readable_version(doc, perm):
     if version is None:
         raise NotFound("Document version not found.")
     if perm not in resolver().version(version):
+        from ..services.activity import log_denied
+        log_denied(perm, version, "view" in resolver().version(version))
         abort(403, description="You do not have permission to access this version.")
     return version
 
@@ -915,7 +925,7 @@ def compare_document_versions(doc_id):
 def upload():
     form = _body()
     folder = get_folder(form.get("folder_id"))
-    _need("edit", folder)
+    _need("upload", folder)
     files = [f for f in request.files.getlist("file") if f.filename]
     if not files:
         raise ValidationError("Choose a file to upload.")
@@ -1025,7 +1035,7 @@ def update_document(doc_id):
     if "folder_id" in data:
         _need("delete", doc)
         folder = get_folder(data.get("folder_id"))
-        _need("edit", folder)
+        _need("upload", folder)
         svc.move_document(doc, folder, g.user)
     if "document_type_id" in data or "tags" in data or any(key.startswith("meta_") for key in data):
         if "document_type_id" not in data and doc.document_type_id is not None:
@@ -1052,7 +1062,7 @@ def copy_document_api(doc_id):
     if doc.current_version is not None:
         _need("download", doc.current_version)  # a copy hands out the content: respect version-level limits
     destination = get_folder(data.get("folder_id"))
-    _need("edit", destination)
+    _need("upload", destination)
     copied = svc.copy_document(doc, destination, g.user)
     return jsonify(ok=True, document=_doc_json(copied)), 201
 
@@ -1117,7 +1127,7 @@ def add_document_link(doc_id):
     doc = svc.get_document(doc_id)
     _need("view", doc)
     folder = get_folder(data.get("folder_id"))
-    _need("edit", folder)
+    _need("upload", folder)
     link = svc.add_link(doc, folder, g.user)
     return jsonify(ok=True, link_id=link.id), 201
 
@@ -1226,7 +1236,9 @@ def directory():
     roles = db.session.execute(select(Role).order_by(Role.name)).scalars().all()
     return jsonify(users=[{"id": u.id, "username": u.username, "display_name": u.display_name, "label": u.label}
                           for u in users],
-                   roles=[{"id": r.id, "name": r.name} for r in roles])
+                   roles=[{"id": r.id, "name": r.name, "description": r.description, "is_system": r.is_system,
+                           "member_count": len(r.users)} for r in roles],
+                   share_levels=[{"key": key, "label": label} for key, (label, _) in access_svc.SHARE_LEVELS.items()])
 
 
 @bp.get("/emails")
@@ -1392,7 +1404,7 @@ def import_email_attachment():
     if not content:
         raise ValidationError("The attachment is empty or could not be read from the original message.")
     folder = get_folder(data.get("folder_id"))
-    _need("edit", folder)
+    _need("upload", folder)
     file = FileStorage(stream=io.BytesIO(content), filename=attachment.filename)
     subject = (record.subject or "(no subject)")[:200]
     doc, created, version = svc.upload_document(
@@ -1477,9 +1489,10 @@ def _counts(items):
 def shared_items():
     """``items``: what other people shared with the current user. ``shared_by_me``: what the
     current user shared with other users, one row per folder/document with its recipients."""
+    from ..security.permissions import active_clause
     entries = db.session.execute(select(AccessEntry).where(
         AccessEntry.principal_type == "user", AccessEntry.principal_id == g.user.id,
-        AccessEntry.target_type.in_(("folder", "document"))
+        AccessEntry.target_type.in_(("folder", "document")), active_clause()
     ).order_by(AccessEntry.created_at.desc())).scalars().all()
     result = []
     for entry in entries:
@@ -1498,13 +1511,15 @@ def shared_items():
             "id": item.id,
             "shared_by": sharer.label if sharer else None,
             "shared_at": _iso(entry.created_at),
+            "expires_at": _iso(entry.expires_at),
             "permissions": sorted(resolver().perms(item)),
             "item": _folder_json(item) if entry.target_type == "folder" else _doc_json(item),
         })
 
     mine = db.session.execute(select(AccessEntry).where(
         AccessEntry.created_by_id == g.user.id, AccessEntry.principal_type == "user",
-        AccessEntry.principal_id != g.user.id, AccessEntry.target_type.in_(("folder", "document"))
+        AccessEntry.principal_id != g.user.id, AccessEntry.target_type.in_(("folder", "document")),
+        active_clause()
     ).order_by(AccessEntry.created_at.desc())).scalars().all()
     by_target = {}
     for entry in mine:
@@ -1530,6 +1545,7 @@ def shared_items():
             "id": entry.principal_id,
             "name": person.label if person else "(removed user)",
             "level": access_svc.level_of(entry.permission_set),
+            "expires_at": _iso(entry.expires_at),
         })
     shared_by_me = [row for row in by_target.values() if row is not None]
     return jsonify(items=result, shared_by_me=shared_by_me,
@@ -1578,7 +1594,10 @@ def permissions(kind, obj_id, number=None):
             "principal_id": entry.principal_id,
             "principal": access_svc.principal_label(entry),
             "permissions": sorted(entry.permission_set),
+            "level": access_svc.level_of(entry.permission_set),
             "created_by_id": entry.created_by_id,
+            "expires_at": _iso(entry.expires_at),
+            "expired": entry.is_expired,
         })
     return jsonify(permissions=sorted(resolver().perms(target)),
                    can_manage=resolver().can("manage", target),
@@ -1602,7 +1621,10 @@ def grant_permissions(kind, obj_id, number=None):
     if target is None and principal_type == "user" and principal_id == g.user.id and "manage" not in perms \
             and not g.user.is_admin:
         raise ValidationError("You cannot remove your own permission to manage the repository.")
-    access_svc.set_entry(target, principal_type, principal_id, perms, g.user)
+    expires_at = access_svc.parse_expiry(data.get("expires_at"))
+    if target is None and expires_at is not None:
+        raise ValidationError("Repository-wide permissions cannot have an end date.")
+    access_svc.set_entry(target, principal_type, principal_id, perms, g.user, expires_at=expires_at)
     return jsonify(ok=True, permissions=sorted(resolver().perms(target)))
 
 
@@ -1637,15 +1659,22 @@ def share_item(kind, obj_id, number=None):
     target = _target(kind, obj_id, number)
     actor_perms = resolver().perms(target)
     if "share" not in actor_perms and "manage" not in actor_perms:
+        from ..services.activity import log_denied
+        log_denied("share", target, target is None or "view" in actor_perms)
         abort(403)
-    principal_type = data.get("principal_type")
+    principal_type = data.get("principal_type") or "user"
+    if principal_type not in ("user", "role"):
+        raise ValidationError("Choose a user or a group.")
     principal_id = _integer(data.get("principal_id"), "principal_id", 1)
+    if target is None:
+        raise ValidationError("Use repository permissions to grant access to the whole library.")
+    expires_at = access_svc.parse_expiry(data.get("expires_at"))
     if data.get("level"):
-        if principal_type != "user":
-            raise ValidationError("Choose a user when sharing by access level.")
-        access_svc.share_level(target, actor_perms, principal_id, data.get("level"), g.user)
+        access_svc.share_level(target, actor_perms, principal_id, data.get("level"), g.user,
+                               principal_type=principal_type, expires_at=expires_at)
     else:
-        access_svc.share(target, actor_perms, principal_type, principal_id, data.getlist("permissions"), g.user)
+        access_svc.share(target, actor_perms, principal_type, principal_id, data.getlist("permissions"), g.user,
+                         expires_at=expires_at)
     return jsonify(ok=True)
 
 
@@ -1746,7 +1775,7 @@ def activity():
     stmt = select(ActivityLog).where(own)
     args = request.args
     for name, column in (("category", ActivityLog.category), ("action", ActivityLog.action),
-                         ("entity_type", ActivityLog.entity_type)):
+                         ("entity_type", ActivityLog.entity_type), ("status", ActivityLog.status)):
         if args.get(name):
             stmt = stmt.where(column == args.get(name).strip())
     if args.get("entity_id"):
@@ -1770,7 +1799,7 @@ def activity():
         "id": item.id, "category": item.category, "action": item.action, "message": item.message,
         "entity_id": item.entity_id, "entity_type": item.entity_type, "entity_name": item.entity_name,
         "details": item.details, "user_id": item.user_id, "user_name": item.user_name,
-        "username": usernames.get(item.user_id), "ip": item.ip,
+        "username": usernames.get(item.user_id), "ip": item.ip, "status": item.status or "success",
         "created_at": item.created_at.isoformat() + "Z",
     } for item in rows], total=total, page=page, per_page=per_page,
         categories=sorted(db.session.execute(select(ActivityLog.category).where(own).distinct()).scalars()))
@@ -2062,6 +2091,76 @@ def admin_update_role(role_id):
     db.session.flush()
     log_activity("admin", "role_saved", f"Role '{role.name}' updated", role.id, entity_type="role",
                  entity_name=role.name, changes=diff(before, _role_audit_snapshot(role)))
+    db.session.commit()
+    reset_resolver()
+    return jsonify(ok=True, role=_role_json(role))
+
+
+def _member_json(user):
+    return {"id": user.id, "username": user.username, "display_name": user.display_name, "label": user.label,
+            "email": user.email, "is_active": bool(user.is_active)}
+
+
+@bp.get("/admin/roles/<int:role_id>/members")
+@api_auth
+def admin_role_members(role_id):
+    _admin_user()
+    role = db.session.get(Role, role_id)
+    if role is None:
+        raise NotFound("Role not found.")
+    members = sorted(role.users, key=lambda u: (u.label or "").lower())
+    return jsonify(role=_role_json(role), members=[_member_json(u) for u in members])
+
+
+@bp.post("/admin/roles/<int:role_id>/members")
+@api_auth
+def admin_add_role_members(role_id):
+    """Add users to a role (group / department). Body: user_ids (list or comma-separated)."""
+    _admin_user()
+    role = db.session.get(Role, role_id)
+    if role is None:
+        raise NotFound("Role not found.")
+    data = _body()
+    raw = data.getlist("user_ids")
+    if len(raw) == 1 and isinstance(raw[0], str):
+        raw = [part for part in raw[0].split(",") if part.strip()]
+    ids = [_integer(value, "user_ids", 1) for value in raw]
+    if not ids:
+        raise ValidationError("Choose at least one user.")
+    users = db.session.execute(select(User).where(User.id.in_(ids))).scalars().all()
+    if len(users) != len(set(ids)):
+        raise NotFound("User not found.")
+    added = [u for u in users if role not in u.roles]
+    for user in added:
+        user.roles.append(role)
+        log_activity("admin", "role_member_added", f"'{user.username}' added to role '{role.name}'", user.id,
+                     entity_type="user", entity_name=user.username,
+                     changes={"roles": {"old": None, "new": role.name}}, details={"role_id": role.id})
+    db.session.commit()
+    reset_resolver()
+    return jsonify(ok=True, added=[u.id for u in added], role=_role_json(role))
+
+
+@bp.delete("/admin/roles/<int:role_id>/members/<int:user_id>")
+@api_auth
+def admin_remove_role_member(role_id, user_id):
+    _admin_user()
+    role = db.session.get(Role, role_id)
+    user = db.session.get(User, user_id)
+    if role is None or user is None:
+        raise NotFound("Role or user not found.")
+    if role not in user.roles:
+        raise NotFound("The user is not a member of this role.")
+    was_admin = user.is_admin
+    user.roles.remove(role)
+    db.session.flush()
+    if was_admin and not user.is_admin:
+        admins = db.session.execute(select(User).where(User.is_active.is_(True))).scalars().all()
+        if not any(other.id != user.id and other.is_admin for other in admins):
+            raise ValidationError("At least one active administrator must remain.")
+    log_activity("admin", "role_member_removed", f"'{user.username}' removed from role '{role.name}'", user.id,
+                 entity_type="user", entity_name=user.username,
+                 changes={"roles": {"old": role.name, "new": None}}, details={"role_id": role.id})
     db.session.commit()
     reset_resolver()
     return jsonify(ok=True, role=_role_json(role))

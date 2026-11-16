@@ -88,7 +88,8 @@ def _scan(file_storage, display_name):
     if result.status == "infected":
         log.warning("Upload '%s' rejected: malware detected (%s, %s)", display_name, result.engine, result.detail)
         log_activity("security", "malware_blocked",
-                     f"Upload '{display_name}' blocked: malware detected ({result.detail or result.engine})")
+                     f"Upload '{display_name}' blocked: malware detected ({result.detail or result.engine})",
+                     status="failed")
         db.session.commit()
         raise ValidationError(f"'{display_name}' was rejected because malware was detected "
                               f"({result.detail or 'threat found'}).")

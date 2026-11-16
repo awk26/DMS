@@ -16,7 +16,10 @@ _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 def require(perm, obj=None, message=None):
     """Abort with 403 unless the signed-in user has ``perm`` on ``obj`` (None = repository)."""
     if not resolver().can(perm, obj):
-        if obj is not None and not resolver().can("view", obj):
+        from ..services.activity import log_denied
+        can_view = obj is None or resolver().can("view", obj)
+        log_denied(perm, obj, can_view)
+        if not can_view:
             abort(404, description="Not found.")  # do not reveal items the user cannot see
         abort(403, description=message or "You do not have permission to do this.")
 

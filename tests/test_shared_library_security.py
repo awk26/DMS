@@ -15,6 +15,10 @@ from dms.services.folders import ensure_home
 from .conftest import PDF, Api, make_user
 
 
+# Written before "restricted by default": Contributor/Reader/Auditor keep repository-wide access here.
+pytestmark = pytest.mark.usefixtures("legacy_repository")
+
+
 @pytest.fixture
 def alice(app, admin):
     return Api(app, make_user("alice", ("Contributor",), email="alice@example.com", display_name="Alice"))

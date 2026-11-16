@@ -180,7 +180,7 @@ def saml_acs():
             raise saml.SamlError("This sign-in was not started here or has already been used. Try again.")
         info = saml.parse_response(request.form.get("SAMLResponse"), relay["rid"])
     except saml.SamlError as exc:
-        log_activity("security", "login_failed", f"SAML sign-in rejected: {exc}")
+        log_activity("security", "login_failed", f"SAML sign-in rejected: {exc}", status="failed")
         db.session.commit()
         return _sso_failure()
     token = _saml_serializer("complete").dumps({**info, "next": relay.get("next")})

@@ -22,20 +22,31 @@ rather than adds to, what the user would otherwise get from their roles or from 
 lowering someone from "Full control" to "Can view" really leaves them view-only, even in the Shared
 library where their role grants more. Grants deeper down (e.g. on a document inside a shared folder)
 override again for that item. Repository-level grants are unchanged (roles and users add up).
+
+Upload: ``upload`` lets someone add new files and subfolders to a folder without changing what is
+already there (``edit`` implies it). What they add is theirs (owner grant), nothing else changes.
+
+Expiry: a grant may carry ``expires_at``. From that moment it is ignored everywhere, as if it had been
+removed, so the person falls back to whatever else they have (e.g. the parent folder's access).
+
+Groups: departments and teams are roles (no separate groups table). A grant to a role on a department
+folder gives every member that access; repository-wide grants are kept for Admin/Records Manager only
+("restricted by default", see migrate._restricted_repository).
 """
 from flask import g, has_request_context
 from sqlalchemy import and_, false, or_, select
 
 from ..extensions import db
-from ..models import AccessEntry, Document, DocumentVersion, Folder
+from ..models import AccessEntry, Document, DocumentVersion, Folder, utcnow
 
-CONTENT_PERMS = ("view", "download", "edit", "delete", "share", "manage")
+CONTENT_PERMS = ("view", "upload", "download", "edit", "delete", "share", "manage")
 PERM_LABELS = {
-    "view": "View", "download": "Download", "edit": "Edit", "delete": "Delete",
+    "view": "View", "upload": "Upload", "download": "Download", "edit": "Edit", "delete": "Delete",
     "share": "Share", "manage": "Manage permissions",
 }
 PERM_HELP = {
     "view": "See the item, its details and in-browser preview",
+    "upload": "Add new files and subfolders (without changing existing ones)",
     "download": "Download original files and ZIP exports",
     "edit": "Upload, create subfolders, new versions, rename, move, check out, edit metadata",
     "delete": "Move to the recycle bin",
@@ -57,10 +68,18 @@ PREDEFINED_ROLES = {
               "Full control of the system, users, roles and settings."),
     "Records Manager": ({"records", "audit"}, set(CONTENT_PERMS),
                         "Manages the repository, recycle bin, retention and check-outs."),
-    "Contributor": (set(), {"view", "download", "edit", "share"},
-                    "Uploads and edits documents and creates folders."),
-    "Reader": (set(), {"view", "download"}, "Views and downloads documents."),
-    "Auditor": ({"audit"}, {"view"}, "Read-only access to content and the audit trail."),
+    # Restricted by default: these roles have no repository-wide access. Members work only in the
+    # department folders they are granted (on the folder, to the role or to a department role).
+    "Contributor": (set(), set(), "Uploads and edits documents in the folders they are given access to."),
+    "Reader": (set(), set(), "Views and downloads documents in the folders they are given access to."),
+    "Auditor": ({"audit"}, set(), "Read-only access to the folders they are given access to."),
+}
+# Repository-wide permissions these roles had before "restricted by default"; the upgrade moves them
+# onto the existing top-level content so nobody loses access to what they could already open.
+LEGACY_REPOSITORY_PERMS = {
+    "Contributor": {"view", "download", "edit", "share"},
+    "Reader": {"view", "download"},
+    "Auditor": {"view"},
 }
 
 ALL = frozenset(CONTENT_PERMS)
@@ -70,9 +89,16 @@ def normalize(perms):
     perms = {p for p in perms if p in CONTENT_PERMS}
     if "manage" in perms:
         return set(ALL)
+    if "edit" in perms:
+        perms.add("upload")
     if perms:
         perms.add("view")
     return perms
+
+
+def active_clause():
+    """SQL condition for grants that have not expired."""
+    return or_(AccessEntry.expires_at.is_(None), AccessEntry.expires_at > utcnow())
 
 
 def parse_perms(values):
@@ -97,7 +123,7 @@ class Resolver:
         if self._entries is None:
             self._entries = {}
             if self.user is not None:
-                rows = db.session.execute(select(AccessEntry).where(or_(
+                rows = db.session.execute(select(AccessEntry).where(active_clause(), or_(
                     and_(AccessEntry.principal_type == "user", AccessEntry.principal_id == self.user.id),
                     and_(AccessEntry.principal_type == "role",
                          AccessEntry.principal_id.in_(self.role_ids or [-1]))))).scalars().all()

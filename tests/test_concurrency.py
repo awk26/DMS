@@ -18,6 +18,10 @@ from dms.services import search
 
 from .conftest import Api, make_user
 
+# Written before "restricted by default": Contributor/Reader/Auditor keep repository-wide access here.
+pytestmark = pytest.mark.usefixtures("legacy_repository")
+
+
 DELAY = 0.6  # seconds spent inside the critical section by every request
 
 

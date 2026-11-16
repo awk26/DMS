@@ -11,6 +11,10 @@ from dms.services.activity import AuditLogImmutable
 from .conftest import PDF, Api, make_user
 
 
+# Written before "restricted by default": Contributor/Reader/Auditor keep repository-wide access here.
+pytestmark = pytest.mark.usefixtures("legacy_repository")
+
+
 @pytest.fixture
 def auditor(app, admin):
     return Api(app, make_user("audrey", ("Auditor",), display_name="Audrey"))
@@ -89,7 +93,7 @@ def test_sharing_and_permission_changes_record_old_and_new_access(api, auditor, 
     api.post(f"/permissions/document/{doc}/share",
              json={"principal_type": "user", "principal_id": bob.user.id, "level": "edit"})
     latest = events(api, action="shared", entity_id=doc)[0]
-    assert latest["details"]["changes"]["permissions"] == {"old": ["view"], "new": ["view", "download", "edit"]}
+    assert latest["details"]["changes"]["permissions"] == {"old": ["view"], "new": ["view", "upload", "download", "edit"]}
 
     assert api.patch(f"/permissions/document/{doc}/inheritance", json={"inherit": False}).status_code == 200
     inh = one(api, action="inheritance_changed", entity_id=doc)

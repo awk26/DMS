@@ -116,10 +116,16 @@ class AccessEntry(db.Model):
     permissions: Mapped[str] = mapped_column(String(200), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     created_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    # Access ends at this moment (UTC); NULL = no end. Expired grants are ignored, not deleted.
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     @property
     def permission_set(self):
         return set(_csv(self.permissions))
+
+    @property
+    def is_expired(self):
+        return self.expires_at is not None and self.expires_at <= utcnow()
 
 
 class ApiToken(db.Model):
@@ -471,6 +477,8 @@ class ActivityLog(db.Model):
     user_name: Mapped[Optional[str]] = mapped_column(String(200))
     ip: Mapped[Optional[str]] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False, index=True)
+    # Outcome: success | denied (no permission) | failed (e.g. rejected sign-in, blocked malware)
+    status: Mapped[str] = mapped_column(String(10), default="success", server_default="success")
 
     @property
     def details(self):

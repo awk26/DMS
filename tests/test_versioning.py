@@ -2,7 +2,12 @@
 nothing stored); once they confirm (on_duplicate=replace) it adds a new version (1.0 -> 1.1 -> 1.2 ...)."""
 import io
 
+import pytest
+
 from .conftest import Api, make_user
+
+# Written before "restricted by default": Contributor/Reader/Auditor keep repository-wide access here.
+pytestmark = pytest.mark.usefixtures("legacy_repository")
 
 
 def versions(api, doc_id):

@@ -8,7 +8,12 @@
 """
 import io
 
+import pytest
+
 from .conftest import Api, make_user
+
+# Written before "restricted by default": Contributor/Reader/Auditor keep repository-wide access here.
+pytestmark = pytest.mark.usefixtures("legacy_repository")
 
 
 def versions(api, doc_id):

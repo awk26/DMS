@@ -69,7 +69,7 @@ def split_script(text):
     return [s for s in statements if s and not s.upper().startswith("USE ")]
 
 
-AUDIT_ROUTINES = ("sp_audit_log_add",)
+AUDIT_ROUTINES = ("sp_audit_log_add", "sp_audit_log_add_v2")
 AUDIT_TRIGGERS = ("trg_activity_log_no_update", "trg_activity_log_no_delete")
 
 

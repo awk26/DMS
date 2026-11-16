@@ -104,8 +104,9 @@ def ensure_predefined_roles():
             role = Role(name=name, description=desc, is_system=True, capabilities=",".join(sorted(caps)))
             db.session.add(role)
             db.session.flush()
-            db.session.add(AccessEntry(target_type="repository", target_id=None, principal_type="role",
-                                       principal_id=role.id, permissions=parse_perms(repo_perms)))
+            if repo_perms:
+                db.session.add(AccessEntry(target_type="repository", target_id=None, principal_type="role",
+                                           principal_id=role.id, permissions=parse_perms(repo_perms)))
             created = True
     if created:
         db.session.commit()

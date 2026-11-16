@@ -48,12 +48,17 @@ group.
 Every important action is recorded in `activity_log` (`services/activity.py`): uploads, new versions,
 check-out/in, renames, moves, copies, shortcuts, property/metadata edits, recycle bin and permanent deletion of
 documents and folders, sharing, permission grants/removals, inheritance changes, role/user/settings changes,
-sign-ins and Gmail events. Each entry stores **who** (user id, name, IP), **what** (category, action, message),
-**which** item (`entity_type`, `entity_id`, `entity_name` snapshot) and **when** (UTC). Where applicable,
-`details.changes` holds `{field: {old, new}}` (e.g. old/new name, folder, tags, metadata, permission sets).
+sign-ins and Gmail events, plus opening (`viewed`) and downloading (`downloaded`) a document and refused attempts
+(`access_denied`). Each entry stores **who** (user id, name, IP), **what** (category, action, message),
+**which** item (`entity_type`, `entity_id`, `entity_name` snapshot), **when** (UTC) and the **outcome**
+(`status`: `success`, `denied` = the user lacked the permission, `failed` = e.g. a rejected sign-in or blocked
+malware). Where applicable, `details.changes` holds `{field: {old, new}}` (e.g. old/new name, folder, tags,
+metadata, permission sets). A denied attempt is written in its own transaction, so it is kept although the request
+fails; when the user could not even see the item, its name is not stored.
 
-* **Read access**: `GET /api/v1/activity` requires the `audit` capability (Admin, Records Manager, Auditor).
-  Filters: `category`, `action`, `entity_type`, `entity_id`, `user_id`, `user`, `q`, `date_from`, `date_to`.
+* **Read access**: `GET /api/v1/activity` is personal: every signed-in user, administrators included, sees only
+  the entries for actions they performed themselves. Filters: `category`, `action`, `entity_type`, `entity_id`,
+  `status`, `q`, `date_from`, `date_to`.
 * **Tamper protection**: entries are append-only. The triggers `trg_activity_log_no_update` /
   `trg_activity_log_no_delete` reject any UPDATE or DELETE, the ORM refuses to flush changes to existing
   entries, and no API changes or deletes them. The `sp_audit_log_add` procedure and the triggers are installed on
@@ -130,23 +135,29 @@ versioned like any other. The archived email and its `.eml` file stay unchanged.
 ### Users, My Files and sharing
 
 - **Accounts.** The first visit creates the administrator. After that anyone who can reach the sign-in page can
-  **Create an account** (full name, work email, user name, password). New accounts get the role chosen under
-  **Admin › Settings › Role for self-created accounts** (default *Contributor*; administrator and records-manager
-  roles are never given this way). Administrators can turn sign-up off there and create accounts under
-  **Admin › Users** instead.
+  **Create an account** (full name, work email, user name, password). Self-created accounts get **no role**: they
+  have their own My Files and whatever others share with them, and an administrator adds them to roles
+  (departments) under **Admin › Users** or **Admin › Roles › Members**. Administrators can turn sign-up off under
+  **Admin › Settings** and create accounts under **Admin › Users** instead.
 - **My Files.** Every user has a private **My Files** folder. Uploads and new folders go there unless you are
   viewing another folder. Nobody else sees it, administrators included, unless you share it. All the *My Files*
   folders sit inside a hidden *Personal files* folder. These folders cannot be renamed, moved or deleted.
-- **Shared library.** The top-level folders that all Contributors see. Use it for team content.
+- **Shared library (restricted by default).** Nobody but Admin and Records Manager has repository-wide access.
+  An administrator creates a top-level folder per department and gives a role access to it (**Share** › pick the
+  role, or **Advanced permissions**). Members of that role see the folder; everyone else does not even see that it
+  exists. Departments and teams are simply roles (custom roles under **Admin › Roles**, members under
+  **Admin › Roles › Members**).
 - **Privacy from administrators.** Administrators run the system (users, roles, settings, top-level folders)
   but cannot see, preview, download, edit or delete any other user's folders or documents, in My Files or in
   the Shared library, unless that user shares them. They see only what they created or what was shared with
   them, at the shared level.
 - **Ownership.** Whoever creates a folder or uploads a document gets full control of it, even inside the shared
   library. They can rename, delete and share it.
-- **Sharing.** **Share** on a folder, document or document row: pick a person and an access level (*Can view*,
-  *Can view & download*, *Can edit*, *Full control*). Sharing a folder shares everything in it. Items shared with
-  you appear under **Shared with me**. The owner can change or remove someone's access on the same page.
+- **Sharing.** **Share** on a folder, document or document row: pick a person or a group (role) and an access level
+  (*Can view*, *Can view & download*, *Can add files*, *Can edit*, *Full control*), optionally with an **end date**
+  (`expires_at`, `YYYY-MM-DD` = until the end of that day UTC). After the end date the grant is ignored, as if it had
+  been removed; the person keeps any other access they have. Sharing a folder shares everything in it. Items shared
+  with you appear under **Shared with me**. The owner can change or remove someone's access on the same page.
   **Advanced permissions** on that page shows roles, inheritance and individual permissions.
 - **Recycle bin.** Deleted items stay restorable for the configured period (default and minimum 30 days), then
   they are deleted permanently. You can **Delete forever** one item or **Empty recycle bin** at any time. This
@@ -158,13 +169,20 @@ versioned like any other. The archived email and its `.eml` file stay unchanged.
 |---|---|---|
 | Admin | everything | administration, records management, audit, email archive |
 | Records Manager | everything | records management (recycle bin, retention, check-out override), audit, email archive |
-| Contributor | view, download, edit, share | — |
-| Reader | view, download | — |
-| Auditor | view | audit log, email archive |
+| Contributor | — (per department folder) | — |
+| Reader | — (per department folder) | — |
+| Auditor | — (per department folder) | own audit log |
 
-Permissions: **view** (see and preview), **download**, **edit** (upload, new versions, rename, move in, check out,
-metadata, create subfolders), **delete** (to the recycle bin), **share** (give others view/download/edit up to your
-own access), **manage** (change permissions and inheritance; implies everything). A folder, document or version
+Contributor, Reader and Auditor work only in the folders they (or a role they hold) are given. On upgrade, the
+repository-wide access these roles used to have is copied once onto every existing top-level Shared library
+folder and root document, so nobody loses access to what they could open before; new top-level folders are
+private until someone grants access.
+
+Permissions: **view** (see and preview), **upload** (add new files and subfolders without changing existing ones;
+what you add is yours), **download**, **edit** (upload, new versions, rename, move in, check out, metadata, create
+subfolders; implies upload), **delete** (to the recycle bin), **share** (give others view/upload/download/edit up to
+your own access), **manage** (change permissions and inheritance; implies everything). Uploading a file whose name
+already exists in the folder makes it a new version of that document, so it needs **edit** on that document. A folder, document or version
 inherits from its parent; **Stop inheriting** copies the current grants onto it so they can then be narrowed.
 Repository-level grants for each role are edited under **Admin › Roles**; grants for specific users or roles on a
 folder/document/version under **More › Permissions**.
