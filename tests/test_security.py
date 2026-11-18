@@ -52,3 +52,20 @@ def test_encrypted_storage_detects_tampering(app):
         storage.read_bytes("documents/t/t/x")
     storage.save_bytes("documents/t/t/empty", b"")
     assert storage.read_bytes("documents/t/t/empty") == b""
+
+
+def test_csp_on_public_and_error_responses_without_unsafe_inline(app, api, monkeypatch):
+    """ZAP: 'CSP Header Not Set' (seen on /api/v1/auth/options) and 'CSP: style-src unsafe-inline'."""
+    client = app.test_client()
+    responses = [client.get("/api/v1/auth/options"), client.get("/api/v1/no-such-endpoint")]
+
+    def broken():
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(api.client.application.view_functions, "api.dashboard", broken)
+    responses.append(api.get("/dashboard"))
+    for r in responses:
+        csp = r.headers.get("Content-Security-Policy", "")
+        assert "default-src 'self'" in csp, r.request.path
+        assert "unsafe-inline" not in csp and "unsafe-eval" not in csp
+        assert r.headers["X-Content-Type-Options"] == "nosniff"

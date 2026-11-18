@@ -47,7 +47,7 @@ def _str(name, default=""):
 # scripts, no plugins, no framing by other sites. data:/blob: images are used by previews and email
 # bodies; Google is allowed as a form target for the Gmail OAuth hand-off.
 DEFAULT_CONTENT_SECURITY_POLICY = (
-    "default-src 'self'; img-src 'self' data: blob:; media-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "default-src 'self'; img-src 'self' data: blob:; media-src 'self'; style-src 'self'; "
     "script-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; "
     "form-action 'self' https://accounts.google.com; frame-ancestors 'self'"
 )

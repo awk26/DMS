@@ -80,3 +80,18 @@ def test_other_users_cannot_see_someone_elses_emails(app, account):
     assert other.get("/emails").json["emails"] == []
     assert other.get(f"/emails/{record.id}").status_code == 404
     assert other.get(f"/emails/{record.id}/eml").status_code == 404
+
+
+def test_email_render_is_a_standalone_sandboxed_document(api, account):
+    """The message frame loads /render by URL (not srcdoc), so it carries its own CSP and the app's CSP
+    can forbid inline styles. Images are embedded as data: URLs; nothing is loaded from this origin."""
+    record, _ = store_email(account, "abc9", build_email())
+    r = api.get(f"/emails/{record.id}/render")
+    assert r.status_code == 200 and r.mimetype == "text/html"
+    csp = r.headers["Content-Security-Policy"]
+    assert "default-src 'none'" in csp and "sandbox" in csp and "frame-ancestors 'self'" in csp
+    html = r.get_data(as_text=True)
+    assert "<script" not in html and "javascript:" not in html
+    assert "data:image/png;base64," in html
+    assert f"/api/v1/emails/{record.id}/inline/" not in html
+    assert api.get(f"/emails/{record.id}").json["email"]["file_missing"] is False

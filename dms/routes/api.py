@@ -89,6 +89,11 @@ bp = Blueprint("api", __name__, url_prefix="/api/v1")
 _UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 EMAIL_STATES = ("archived", "inbox", "trashed", "spam", "deleted")
 RENDER_CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; sandbox; "
+# Email bodies: as RENDER_CSP, plus embedded fonts; links may open in a new tab (the frame's <base target>).
+EMAIL_RENDER_CSP = (
+    "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; base-uri 'none'; "
+    "form-action 'none'; sandbox allow-popups allow-popups-to-escape-sandbox; "
+)
 
 
 def _body():
@@ -1336,14 +1341,11 @@ def email_detail(email_id):
     except FileNotFoundError:
         inline = None  # original file missing: fall back to what was recorded at archive time
     data = _email_json(record, inline)
-    data.update(access=sorted(g.email_perms), is_owner="share" in g.email_perms)
+    data.update(access=sorted(g.email_perms), is_owner="share" in g.email_perms, file_missing=inline is None)
     return jsonify(email=data)
 
 
-@bp.get("/emails/<int:email_id>/body")
-@api_auth
-def email_body(email_id):
-    record = _own_email(email_id)
+def _fetch_linked_images_once(record):
     from ..services import email_images
     if record.images_fetched_at is None and current_app.config.get("EMAIL_REMOTE_IMAGES"):
         # First view of an email archived before images were downloaded (or whose download failed
@@ -1353,6 +1355,60 @@ def email_body(email_id):
         except Exception:
             current_app.logger.exception("Downloading the linked images of email #%s failed", record.id)
             db.session.rollback()
+
+
+def _data_url(mimetype, content):
+    import base64
+    return f"data:{mimetype};base64,{base64.b64encode(content).decode('ascii')}"
+
+
+@bp.get("/emails/<int:email_id>/render")
+@api_auth
+def email_render(email_id):
+    """The email body as a standalone, sandboxed HTML document for an iframe ``src``.
+
+    Images (embedded and stored copies of linked ones) are inlined as data: URLs, so the document needs
+    nothing from this origin. It has its own CSP: an iframe that loads a URL does not inherit the app
+    page's policy, which lets the app's own CSP forbid inline styles (ZAP: CSP style-src unsafe-inline)
+    while the email keeps its formatting.
+    """
+    from ..models import EmailImage
+    from ..storage import get_storage
+    record = _own_email(email_id)
+    _fetch_linked_images_once(record)
+    try:
+        msg = email_svc.load_message(record)
+    except FileNotFoundError:
+        raise NotFound("The original message file is missing.")
+
+    def inline_url(idx):
+        part = email_svc.find_part(msg, idx)
+        mimetype = email_svc.inline_image_type(part) if part is not None else None
+        return _data_url(mimetype, email_svc.part_bytes(part)) if mimetype else ""
+
+    def image_url(image_id):
+        row = db.session.get(EmailImage, image_id)
+        if row is None or row.email_id != record.id or row.status != "stored" or not row.storage_key:
+            return ""
+        try:
+            return _data_url(row.content_type, get_storage().read_bytes(row.storage_key))
+        except FileNotFoundError:
+            return ""
+
+    try:
+        html_doc = email_svc.render_preview_html(record, inline_url, image_url=image_url)
+    except FileNotFoundError:
+        raise NotFound("The original message file is missing.")
+    resp = _frameable(Response(html_doc, mimetype="text/html"), EMAIL_RENDER_CSP)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@bp.get("/emails/<int:email_id>/body")
+@api_auth
+def email_body(email_id):
+    record = _own_email(email_id)
+    _fetch_linked_images_once(record)
     try:
         html_doc = email_svc.render_preview_html(
             record, lambda idx: url_for("api.email_inline_part", email_id=record.id, part_index=idx),
