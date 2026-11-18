@@ -16,6 +16,8 @@ def _defaults():
         "recycle_bin_days": 30,               # at least 30: deleted items stay restorable for a month
         "home_container_folder_id": None,     # hidden folder that holds every user's "My Files"
         "restricted_repository_migrated": False,  # upgrade: role repository grants moved to top-level content
+        "owner_backfill_done": False,         # upgrade: owner_id set from created_by_id once
+        "download_link_seconds": 60,          # lifetime of signed download links (Permissions Matrix 9.10)
         "folder_name_pattern": "",            # optional regex every folder name must match
         "document_name_pattern": "",          # optional regex every document name must match
         "name_max_length": 200,

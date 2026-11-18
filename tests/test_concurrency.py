@@ -189,11 +189,12 @@ def test_concurrent_check_outs_only_one_wins(users, monkeypatch):
 
 
 def test_concurrent_renames_second_gets_conflict_not_silent_overwrite(users, monkeypatch):
-    alice, bob, folder = users
+    alice, _, folder = users
     doc_id = alice.doc("old.txt", b"v1", folder_id=folder)
+    other_tab = Api(alice.client.application, alice.user)  # renaming is owner/Admin only: the same owner in a second session
     slow(monkeypatch, search, "index_document_meta")
     r1, r2 = run_together(lambda: alice.patch(f"/documents/{doc_id}", json={"name": "alice.txt"}),
-                          lambda: bob.patch(f"/documents/{doc_id}", json={"name": "bob.txt"}))
+                          lambda: other_tab.patch(f"/documents/{doc_id}", json={"name": "bob.txt"}))
     assert sorted([r1.status_code, r2.status_code]) == [200, 409], (r1.json, r2.json)
     winner = r1 if r1.status_code == 200 else r2
     assert fresh(Document, id=doc_id)[0].name == winner.json["document"]["name"]

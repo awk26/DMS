@@ -134,6 +134,35 @@ def log_denied(permission, obj, can_view):
         log.exception("Could not record a denied access attempt")
 
 
+def log_admin_override(action, obj):
+    """Record that an administrator used access they would not have as an ordinary user (Permissions
+    Matrix 1.3 / 9.12). Written in its own transaction, like refusals, so it is kept whatever happens
+    to the request."""
+    from .access import target_key, target_label
+    if not has_request_context() or getattr(g, "user", None) is None:
+        return
+    ttype, tid = target_key(obj)
+    owner = getattr(obj, "owner", None) or getattr(getattr(obj, "document", None), "owner", None)
+
+    def callproc(proc, args):
+        raw = conn.connection.cursor()
+        try:
+            raw.callproc(proc, args)
+            while raw.nextset():
+                pass
+        finally:
+            raw.close()
+
+    try:
+        with db.engine.begin() as conn:
+            _write(callproc, "admin", "override", f"Administrator override ({action}): {target_label(obj)}",
+                   tid, ttype, target_label(obj),
+                   _details_json(None, {"permission": action, "owner": owner.username if owner else None}),
+                   "success")
+    except Exception:
+        log.exception("Could not record an administrator override")
+
+
 def log_folder(target, action, /, **details):
     """Record a structural change for folder ``target`` (None = the root level, not recorded)."""
     if target is None:

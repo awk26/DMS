@@ -6,6 +6,7 @@ from typing import Optional
 from sqlalchemy import (
     BigInteger, Boolean, Column, DateTime, ForeignKey, Integer, String, Table, Text, UniqueConstraint, Index,
 )
+from sqlalchemy import event
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .extensions import db
@@ -69,6 +70,8 @@ class User(db.Model):
     failed_logins: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime)
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # Set when an administrator deactivates the account, cleared on reactivation (Permissions Matrix 7).
+    deactivated_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     # Personal "My Files" folder: private to the user until they share something from it.
     home_folder_id: Mapped[Optional[int]] = mapped_column(ForeignKey("folders.id", ondelete="SET NULL",
@@ -181,6 +184,10 @@ class Folder(TimestampMixin, db.Model):
     parent_id: Mapped[Optional[int]] = mapped_column(ForeignKey("folders.id"), index=True)
     inherit_permissions: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="1")
     created_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    # Owner (Permissions Matrix 1): the creator, until an administrator reassigns it.
+    owner_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
+    # Legal hold blocks delete, purge and move for everyone, administrators included.
+    legal_hold: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
     deleted_batch: Mapped[Optional[str]] = mapped_column(String(32), index=True)
     deleted_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
@@ -192,6 +199,7 @@ class Folder(TimestampMixin, db.Model):
     children: Mapped[list["Folder"]] = relationship(back_populates="parent", order_by="Folder.name")
     documents: Mapped[list["Document"]] = relationship(back_populates="folder")
     created_by: Mapped[Optional[User]] = relationship(foreign_keys=[created_by_id])
+    owner: Mapped[Optional[User]] = relationship(foreign_keys=[owner_id])
 
     @property
     def is_deleted(self):
@@ -329,6 +337,8 @@ class Document(TimestampMixin, db.Model):
     deleted_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     document_type_id: Mapped[Optional[int]] = mapped_column(ForeignKey("document_types.id", ondelete="SET NULL"))
     created_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    owner_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
+    legal_hold: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
     inherit_permissions: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="1")
     checked_out_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     checked_out_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
@@ -347,6 +357,7 @@ class Document(TimestampMixin, db.Model):
         foreign_keys=[current_version_id], post_update=True)
     document_type: Mapped[Optional[DocumentType]] = relationship()
     created_by: Mapped[Optional[User]] = relationship(foreign_keys=[created_by_id])
+    owner: Mapped[Optional[User]] = relationship(foreign_keys=[owner_id])
     checked_out_by: Mapped[Optional[User]] = relationship(foreign_keys=[checked_out_by_id])
     tags: Mapped[list[Tag]] = relationship(secondary=document_tags, order_by="Tag.name")
     metadata_values: Mapped[list[MetadataValue]] = relationship(cascade="all, delete-orphan")
@@ -512,6 +523,8 @@ class GmailAccount(db.Model):
     lock_until: Mapped[Optional[datetime]] = mapped_column(DateTime)
     legacy_imported: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    user: Mapped[Optional[User]] = relationship(foreign_keys=[user_id])
+
 
 class ArchivedEmail(db.Model):
     __tablename__ = "archived_emails"
@@ -600,3 +613,13 @@ class PendingImport(db.Model):
     last_error: Mapped[Optional[str]] = mapped_column(String(1000))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+
+# --------------------------------------------------------------------------- ownership default
+
+@event.listens_for(Folder, "before_insert")
+@event.listens_for(Document, "before_insert")
+def _default_owner(mapper, connection, target):
+    """Ownership means the user who created the folder or uploaded the file (Permissions Matrix 1)."""
+    if target.owner_id is None:
+        target.owner_id = target.created_by_id

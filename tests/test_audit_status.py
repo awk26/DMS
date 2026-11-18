@@ -42,9 +42,7 @@ def test_denied_attempt_is_logged_for_the_user_who_tried(api, bob):
     entry = denied[0]
     assert entry["action"] == "access_denied" and entry["entity_type"] == "document"
     assert entry["entity_id"] == doc and entry["entity_name"] == "Document 'minutes.pdf'"
-    assert entry["details"]["permission"] == "delete" and entry["user_id"] == bob.user.id
-    # Personal log unchanged: the owner does not see Bob's attempt.
-    assert events(api, status="denied") == []
+    assert entry["details"]["permission"] == "item.delete" and entry["user_id"] == bob.user.id
 
 
 def test_denied_attempt_on_a_hidden_item_does_not_store_its_name(api, bob):
@@ -60,7 +58,7 @@ def test_denied_entry_survives_the_failed_request(api, bob):
     assert bob.post("/folders", json={"name": "Sneaky", "parent_id": folder}).status_code == 404
     db.session.rollback()  # end the test's own snapshot so the separately committed entry is visible
     rows = db.session.query(ActivityLog).filter_by(user_id=bob.user.id, status="denied").all()
-    assert len(rows) == 1 and rows[0].details["permission"] == "upload"
+    assert len(rows) == 1 and rows[0].details["permission"] == "folder.create_child"
 
 
 def test_opening_and_downloading_a_document_are_logged(api):
@@ -83,8 +81,9 @@ def test_failed_sign_in_has_status_failed(app, anon, admin):
     assert row.status == "failed"
 
 
-def test_status_filter_only_returns_own_entries(api, bob):
+def test_status_filter_only_returns_own_entries_for_contributors(api, bob):
     folder = api.folder("Board")
     assert bob.get(f"/folders/{folder}").status_code == 404
-    assert all(e["user_id"] == api.user.id for e in events(api))
     assert all(e["user_id"] == bob.user.id for e in events(bob))
+    # Administrators see every user's entries, including refusals (admin.audit).
+    assert any(e["user_id"] == bob.user.id for e in events(api, status="denied"))

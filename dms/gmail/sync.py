@@ -166,11 +166,40 @@ def connect_mailbox(user, creds, ip=None):
     return sync_account(account_id, trigger="connect")
 
 
+def _active_tokens(user_id):
+    return [t for t in db.session.execute(select(GmailAccount.token_enc).where(
+        GmailAccount.user_id == user_id, GmailAccount.is_active.is_(True))).scalars() if t]
+
+
 def disconnect_mailbox(user, ip=None):
-    """Stop archiving the user's mailbox and forget its token. Archived emails stay. Returns the count."""
+    """Stop archiving the user's mailbox, revoke its token at Google and forget it. Archived emails stay.
+    Returns the count."""
+    from .auth import revoke_token
+    tokens = _active_tokens(user.id)
     count = sp.call_one("sp_gmail_account_disconnect", user.id, user.label, ip)["disconnected"]
     db.session.commit()
+    for token in tokens:
+        revoke_token(token)
     return count
+
+
+def admin_disconnect(account):
+    """An administrator disables/unlinks someone's mailbox link (email.manage_any). No content is read;
+    the token is revoked and removed, archived emails stay with their owner."""
+    from .auth import revoke_token
+    token = account.token_enc
+    was_active = bool(account.is_active)
+    account.is_active = False
+    account.token_enc = None
+    account.last_sync_status = "disconnected"
+    owner = account.user
+    log_activity("gmail", "disconnected_by_admin",
+                 f"Gmail account {account.email} disconnected by an administrator", account.id,
+                 entity_type="mailbox", entity_name=account.email,
+                 details={"owner": owner.username if owner else None, "was_active": was_active})
+    db.session.commit()
+    revoke_token(token)
+    return was_active
 
 
 def _mark_account(account_id, code, message):
@@ -368,6 +397,10 @@ def sync_account(account_id, service=None, trigger="scheduled"):
     account = db.session.get(GmailAccount, account_id)
     if account is None or not account.is_active or account.user_id is None:
         result.status, result.message = "not_connected", "Gmail is not connected."
+        return result
+    if account.user is None or not account.user.is_active:
+        # Deactivated users' mailboxes are not synced (Permissions Matrix 7); reactivation resumes it.
+        result.status, result.message = "user_inactive", "The mailbox owner's account is deactivated."
         return result
     result.account = account.email
     try:

@@ -140,52 +140,68 @@ versioned like any other. The archived email and its `.eml` file stay unchanged.
   (departments) under **Admin › Users** or **Admin › Roles › Members**. Administrators can turn sign-up off under
   **Admin › Settings** and create accounts under **Admin › Users** instead.
 - **My Files.** Every user has a private **My Files** folder. Uploads and new folders go there unless you are
-  viewing another folder. Nobody else sees it, administrators included, unless you share it. All the *My Files*
+  viewing another folder. Nobody else sees it unless you share it (administrators can, and that is audited). All the *My Files*
   folders sit inside a hidden *Personal files* folder. These folders cannot be renamed, moved or deleted.
 - **Shared library (restricted by default).** Nobody but Admin and Records Manager has repository-wide access.
   An administrator creates a top-level folder per department and gives a role access to it (**Share** › pick the
   role, or **Advanced permissions**). Members of that role see the folder; everyone else does not even see that it
   exists. Departments and teams are simply roles (custom roles under **Admin › Roles**, members under
   **Admin › Roles › Members**).
-- **Privacy from administrators.** Administrators run the system (users, roles, settings, top-level folders)
-  but cannot see, preview, download, edit or delete any other user's folders or documents, in My Files or in
-  the Shared library, unless that user shares them. They see only what they created or what was shared with
-  them, at the shared level.
-- **Ownership.** Whoever creates a folder or uploads a document gets full control of it, even inside the shared
-  library. They can rename, delete and share it.
-- **Sharing.** **Share** on a folder, document or document row: pick a person or a group (role) and an access level
-  (*Can view*, *Can view & download*, *Can add files*, *Can edit*, *Full control*), optionally with an **end date**
-  (`expires_at`, `YYYY-MM-DD` = until the end of that day UTC). After the end date the grant is ignored, as if it had
-  been removed; the person keeps any other access they have. Sharing a folder shares everything in it. Items shared
-  with you appear under **Shared with me**. The owner can change or remove someone's access on the same page.
-  **Advanced permissions** on that page shows roles, inheritance and individual permissions.
-- **Recycle bin.** Deleted items stay restorable for the configured period (default and minimum 30 days), then
-  they are deleted permanently. You can **Delete forever** one item or **Empty recycle bin** at any time. This
-  only affects items you deleted or are allowed to delete.
+- **Permissions Matrix v2.** Every request is evaluated in this order (`security/policy.py`, one
+  `can(user, action, item)` for every endpoint): an inactive user is denied everything; an item under **legal
+  hold** cannot be deleted, purged or moved by anyone, administrators included; an **administrator** may do
+  everything else on every folder and document, and each use of access they would not have as an ordinary user
+  is written to the audit log (`admin` / `override`); the **owner** may do every owner action; anyone else gets
+  only what a **share** gives; otherwise the item is invisible (404).
+- **Administrators and email.** Archived emails stay private: an administrator sees mailbox status, last sync,
+  counts and errors and can disconnect a mailbox (`POST /admin/gmail/accounts/{id}/disconnect`), but cannot read
+  an email unless its owner shares it.
+- **Ownership.** The owner is whoever created the folder or uploaded the file (`owner_id`), until an
+  administrator reassigns it (`POST /admin/ownership/reassign`, one item or everything a user owns). Only the
+  owner (or an administrator) can rename, move, copy, delete, restore an older version, restore from the recycle
+  bin and share. If someone with Edit access uploads into your folder, the upload is theirs; you get View and
+  Download on it, not rename or delete, and you can delete or move the folder only when it holds none of someone
+  else's items.
+- **Sharing.** **Share** on a folder, document or archived email: pick an active user or a group (role) and a level:
+  *Can view* (preview, metadata, version history), *Can view & download* (also download any version) or
+  *Can edit* (also upload new versions, edit tags/metadata, create subfolders and upload inside a shared folder),
+  optionally with an **end date** (`expires_at`, `YYYY-MM-DD` = until the end of that day UTC). After the end date
+  the grant is ignored. Sharing a folder shares everything in it, including items added later. Older grants keep
+  working: "Full control" given to someone other than the owner now works as Edit, and "Can add files" still lets
+  the person add files. Items shared with you appear under **Shared with me**.
+- **Recycle bin.** Delete moves an item to the recycle bin for the configured period (default 30 days). Owners
+  can restore their own items within that period; only administrators can **Delete forever** or **Empty recycle
+  bin**, and never items under legal hold. Deleting a folder deletes its contents; restoring brings the whole tree
+  back.
+- **User lifecycle.** Deactivating a user blocks sign-in, revokes their API tokens, stops their mailbox sync and
+  removes the shares they received; their files, emails, ownership and the shares they gave are kept until an
+  administrator reassigns them. Reactivating restores sign-in and the original ownership. Nobody can change
+  their own role, and the last active administrator cannot be demoted or deactivated.
+- **Legal hold, retention, settings, audit** are Admin only: `PUT /admin/legal-hold/{folder|document}/{id}`
+  (`hold`, `reason`), `GET /admin/legal-holds`, `PATCH /folders/{id}/retention`. Administrators see the whole
+  audit log (`GET /activity?user_id=`); everyone else sees their own entries.
+- **Download links.** `GET /documents/{id}/download-link` issues a short-lived signed URL (60 s by default,
+  setting `download_link_seconds`) only after the permission check; the link is checked again when used.
 
 ### Roles and permissions
 
 | Role | Repository permissions | System capabilities |
 |---|---|---|
-| Admin | everything | administration, records management, audit, email archive |
-| Records Manager | everything | records management (recycle bin, retention, check-out override), audit, email archive |
-| Contributor | — (per department folder) | — |
+| Admin | everything, on every item (audited) | administration, legal hold, retention, settings, audit log, ownership |
+| Records Manager | create top-level folders; at most Edit on other people's items | check-out override |
+| Contributor | — (own items and what is shared with them) | — |
 | Reader | — (per department folder) | — |
 | Auditor | — (per department folder) | own audit log |
 
-Contributor, Reader and Auditor work only in the folders they (or a role they hold) are given. On upgrade, the
-repository-wide access these roles used to have is copied once onto every existing top-level Shared library
-folder and root document, so nobody loses access to what they could open before; new top-level folders are
-private until someone grants access.
+Contributor, Reader and Auditor work only in their own items and the folders they (or a role they hold) are
+given. On upgrade, existing folders and documents are owned by the user who created them (one-time back-fill).
 
-Permissions: **view** (see and preview), **upload** (add new files and subfolders without changing existing ones;
-what you add is yours), **download**, **edit** (upload, new versions, rename, move in, check out, metadata, create
-subfolders; implies upload), **delete** (to the recycle bin), **share** (give others view/upload/download/edit up to
-your own access), **manage** (change permissions and inheritance; implies everything). Uploading a file whose name
-already exists in the folder makes it a new version of that document, so it needs **edit** on that document. A folder, document or version
-inherits from its parent; **Stop inheriting** copies the current grants onto it so they can then be narrowed.
-Repository-level grants for each role are edited under **Admin › Roles**; grants for specific users or roles on a
-folder/document/version under **More › Permissions**.
+Share levels map to these permission keys (`security/policy.py`): `item.view`, `item.download`,
+`item.version.create`, `item.metadata.edit`, `folder.create_child`, `folder.upload` (through a share);
+`item.version.restore`, `item.rename`, `item.move`, `item.copy`, `item.delete`, `item.restore`, `item.share`
+(owner or Admin); `item.purge` (Admin, not under legal hold); `email.manage_any`, `admin.users`,
+`admin.ownership`, `admin.policy`, `admin.audit` (Admin). Every folder and document in the API carries
+`owner`, `is_owner`, `legal_hold` and the `actions` the current user may perform.
 
 ### Documents and versions
 

@@ -41,9 +41,15 @@ def share(owner, kind, item_id, person, level, **extra):
                       json={"principal_type": "user", "principal_id": person.user.id, "level": level, **extra})
 
 
-def department(api, finance, level="upload"):
+def department(api, finance, level="edit"):
     folder = api.folder("Finance")
-    grant_role(api, "folder", folder, finance, level)
+    if level == "upload":
+        # Legacy "add files" grant (no longer offered in the Share dialog, still honoured).
+        r = api.post(f"/permissions/folder/{folder}/grant",
+                     json={"principal_type": "role", "principal_id": finance.id, "permissions": ["view", "upload"]})
+        assert r.status_code == 200, r.json
+    else:
+        grant_role(api, "folder", folder, finance, level)
     return folder
 
 
@@ -83,7 +89,7 @@ def test_department_role_grant_reaches_only_members(api, alice, bob, finance):
 # --------------------------------------------------------------------------- upload permission
 
 def test_upload_only_member_adds_files_but_cannot_change_others(api, alice, finance):
-    folder = department(api, finance)
+    folder = department(api, finance, level="upload")
     theirs = api.doc("budget.txt", b"admin's", folder_id=folder)
     perms = alice.get(f"/permissions/folder/{folder}").json["permissions"]
     assert "upload" in perms and "edit" not in perms
@@ -100,7 +106,7 @@ def test_upload_only_member_adds_files_but_cannot_change_others(api, alice, fina
 
 
 def test_upload_only_member_cannot_replace_a_document_by_uploading_the_same_name(api, alice, finance):
-    folder = department(api, finance)
+    folder = department(api, finance, level="upload")
     theirs = api.doc("budget.txt", b"original", folder_id=folder)
     r = alice.upload("budget.txt", b"replacement", folder_id=folder)
     assert r.status_code == 400
@@ -155,20 +161,20 @@ def test_end_date_must_be_in_the_future(api, bob):
     assert share(api, "folder", folder, bob, "view", expires_at="not a date").status_code == 400
 
 
-def test_sharer_without_manage_cannot_put_an_end_on_existing_access(api, alice, bob, app):
+def test_only_the_owner_or_admin_can_reshare_even_with_a_legacy_share_grant(api, alice, bob, app):
     folder = api.folder("Board")
-    # Alice may share but not manage.
+    # A legacy grant that included "share": under Permissions Matrix v2 resharing is owner/Admin only.
     r = api.post(f"/permissions/folder/{folder}/grant",
                  json={"principal_type": "user", "principal_id": alice.user.id,
                        "permissions": ["view", "download", "edit", "share"]})
     assert r.status_code == 200, r.json
     assert share(api, "folder", folder, bob, "view").status_code == 200
     end = (utcnow() + timedelta(days=2)).date().isoformat()
-    assert share(alice, "folder", folder, bob, "download", expires_at=end).status_code == 200
+    assert share(alice, "folder", folder, bob, "download", expires_at=end).status_code == 403
     entry = db.session.query(AccessEntry).filter_by(target_type="folder", target_id=folder,
                                                     principal_type="user", principal_id=bob.user.id).one()
     db.session.refresh(entry)
-    assert entry.expires_at is None and "download" in entry.permission_set
+    assert entry.expires_at is None and entry.permission_set == {"view"}
 
 
 # --------------------------------------------------------------------------- roles as groups
@@ -197,7 +203,7 @@ def test_last_admin_cannot_be_removed_from_admin_role(api, admin):
 def test_directory_lists_groups_and_share_levels(bob, finance):
     data = bob.get("/directory").json
     assert any(r["name"] == "Finance" and r["description"] == "Finance department" for r in data["roles"])
-    assert "upload" in [lvl["key"] for lvl in data["share_levels"]]
+    assert [lvl["key"] for lvl in data["share_levels"]] == ["view", "download", "edit"]
 
 
 # --------------------------------------------------------------------------- upgrade of existing data

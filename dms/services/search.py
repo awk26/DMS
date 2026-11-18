@@ -544,9 +544,13 @@ def _document_query(params, resolver, ids=None):
 
 
 def _email_query(params, user, ids=None):
-    # Only emails from the user's own mailboxes (same rule as sp_email_list / sp_email_get_owned).
+    # Emails from the user's own mailboxes plus emails shared with them (Permissions Matrix 5 / 9.9).
+    # Administrators get no other emails: they never see email content without a share.
+    from .emails import shared_with
+    shared_ids = [e.id for e in shared_with(user)]
+    mine = GmailAccount.user_id == user.id
     stmt = (select(ArchivedEmail).join(GmailAccount, GmailAccount.id == ArchivedEmail.account_id)
-            .where(GmailAccount.user_id == user.id))
+            .where(mine | ArchivedEmail.id.in_(shared_ids) if shared_ids else mine))
     if ids is not None:
         stmt = stmt.where(ArchivedEmail.id.in_(ids))
     if params.date_from:

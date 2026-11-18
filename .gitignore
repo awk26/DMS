@@ -15,6 +15,13 @@ emails/
 *.eml
 /instance/news/
 
+# Playwright end-to-end tests: kept local only, never committed
+e2e/
+test-results/
+playwright-report/
+playwright/.cache/
+blob-report/
+
 # Python
 venv/
 .venv/

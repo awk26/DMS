@@ -12,23 +12,29 @@ from .folders import NotFound
 
 TARGET_TYPES = ("repository", "folder", "document", "version")
 SHAREABLE = ("view", "upload", "download", "edit")
-# Simple access levels offered by the Share dialog, lowest first.
+# The three share levels of the Permissions Matrix (section 2), lowest first. Rename, move, delete,
+# restore version and reshare are never shared: they stay with the owner and administrators.
 SHARE_LEVELS = {
     "view": ("Can view", {"view"}),
     "download": ("Can view & download", {"view", "download"}),
-    "upload": ("Can add files", {"view", "download", "upload"}),
     "edit": ("Can edit", {"view", "download", "edit"}),
-    "full": ("Full control", {"manage"}),
 }
+# Older grants keep working; they are shown with these labels. "Full control" given to someone other
+# than the owner now works as Edit (see security/permissions.py).
+LEGACY_LEVELS = {"upload": "Can add files (legacy)"}
 
 
 def level_of(perms):
-    """The Share-dialog level that best describes a permission set (None if it grants nothing)."""
-    perms = normalize(perms)
-    for key in ("full", "edit", "upload", "download", "view"):
-        if normalize(SHARE_LEVELS[key][1]) <= perms:
-            return key
-    return None
+    """The share level that describes what a grant gives a non-owner (None if it grants nothing)."""
+    from ..security.permissions import cap
+    perms = cap(perms)
+    if "edit" in perms:
+        return "edit"
+    if "upload" in perms:
+        return "upload"
+    if "download" in perms:
+        return "download"
+    return "view" if "view" in perms else None
 
 
 def parse_expiry(value):
@@ -171,6 +177,14 @@ def _resolve_principal(principal_type, principal_id):
     return p
 
 
+def _require_active(principal_type, principal_id):
+    """Sharing is only with active DMS users (Permissions Matrix 1 / 9.13)."""
+    if principal_type == "user":
+        person = _resolve_principal("user", principal_id)
+        if not person.is_active:
+            raise ValidationError("You can share only with active DMS users.")
+
+
 def set_entry(obj, principal_type, principal_id, perms, actor=None, audit_action=None, level=None,
               expires_at=None):
     """Create or replace the grant for one principal on obj. Empty perms removes the grant.
@@ -231,7 +245,8 @@ def share_level(obj, actor_perms, principal_id, level, actor, principal_type="us
     may only share can add view/upload/download/edit up to their own access.
     """
     if level not in SHARE_LEVELS:
-        raise ValidationError("Choose what the person can do.")
+        raise ValidationError("Choose View, Download or Edit.")
+    _require_active(principal_type, principal_id)
     if principal_type == "user" and actor is not None and int(principal_id) == actor.id:
         raise ValidationError("You cannot change your own access.")
     perms = SHARE_LEVELS[level][1]
@@ -249,6 +264,7 @@ def share(obj, actor_perms, principal_type, principal_id, perms, actor, level=No
     perms = {p for p in perms if p in SHAREABLE}
     if not perms:
         raise ValidationError("Choose at least one permission to share.")
+    _require_active(principal_type, principal_id)
     if not normalize(perms) <= actor_perms:
         raise ValidationError("You can only share permissions you have yourself.")
     existing = set()

@@ -34,6 +34,7 @@ from ..models import (
     EmailAttachment,
     Favourite,
     Folder,
+    GmailAccount,
     FolderActivity,
     MetadataField,
     Role,
@@ -58,6 +59,7 @@ from ..security.auth import (
     user_for_token,
     verify_local,
 )
+from ..security import policy
 from ..security.permissions import CONTENT_PERMS, SYSTEM_CAPS, parse_perms, resolver, reset_resolver
 from ..services import access as access_svc
 from ..services import documents as svc, emails as email_svc, metadata as meta_svc, search as search_svc
@@ -421,14 +423,10 @@ def register():
                                            and not user.mfa_enabled)), 201
 
 
-def _need(perm, obj):
-    if not resolver().can(perm, obj):
-        from ..services.activity import log_denied
-        can_view = obj is None or resolver().can("view", obj)
-        log_denied(perm, obj, can_view)  # kept although the request fails; only this user sees it
-        if not can_view:
-            abort(404)
-        abort(403)
+def _need(action, obj, message=None):
+    """Every endpoint checks access through the one policy function (security/policy.py): 404 for items
+    the user cannot see, 403 otherwise; refusals and administrator overrides are audited."""
+    policy.require(action, obj, message)
 
 
 def _iso(value):
@@ -443,7 +441,9 @@ def _visible_path(f):
 
 def _folder_json(f):
     data = {"id": f.id, "name": f.name, "parent_id": f.parent_id, "path": _visible_path(f),
-            "updated_at": f.updated_at.isoformat() + "Z", "permissions": sorted(resolver().folder(f))}
+            "updated_at": f.updated_at.isoformat() + "Z", "permissions": sorted(resolver().folder(f)),
+            "owner": f.owner.username if f.owner else None, "is_owner": f.owner_id == g.user.id,
+            "legal_hold": bool(f.legal_hold), "actions": policy.actions_for(f)}
     if f.deleted_at is not None:
         data.update(deleted_at=_iso(f.deleted_at), expires_at=_iso(recycle_expiry(f.deleted_at)))
     return data
@@ -468,6 +468,8 @@ def _doc_json(d):
         "document_type_id": d.document_type_id,
         "metadata": {mv.field.name: mv.value for mv in d.metadata_values},
         "permissions": sorted(resolver().document(d)),
+        "owner": d.owner.username if d.owner else None, "is_owner": d.owner_id == g.user.id,
+        "legal_hold": bool(d.legal_hold), "actions": policy.actions_for(d),
     }
     if d.deleted_at is not None:
         data.update(deleted_at=_iso(d.deleted_at), expires_at=_iso(recycle_expiry(d.deleted_at)))
@@ -581,7 +583,7 @@ def folders():
 def new_folder():
     data = _body()
     parent = get_folder(data.get("parent_id"))
-    _need("upload", parent)
+    _need("folder.create_child", parent)
     folder = create_folder(data.get("name", ""), parent, g.user)
     return jsonify(ok=True, folder=_folder_json(folder)), 201
 
@@ -609,7 +611,7 @@ def root_folder():
 @api_auth
 def folder_detail(folder_id):
     folder = get_folder(folder_id)
-    _need("view", folder)
+    _need("item.view", folder)
     visible = resolver().visible_folder_ids()
     children = sorted((child for child in folder.live_children if visible is None or child.id in visible),
                       key=lambda child: child.name.lower())
@@ -626,13 +628,14 @@ def folder_detail(folder_id):
 def update_folder(folder_id):
     data = _body()
     folder = get_folder(folder_id)
-    _need("edit", folder)
+    _need("item.view", folder)
     if "name" in data:
+        _need("item.rename", folder)
         rename_folder(folder, data.get("name", ""))
     if "parent_id" in data:
-        _need("delete", folder)
+        _need("item.move", folder)
         destination = get_folder(data.get("parent_id"))
-        _need("upload", destination)
+        _need("folder.create_child", destination)
         # Moving takes everything out of its current place, exactly like delete: check the whole subtree.
         ensure_can_remove_subtree(subtree(folder), resolver(), "move")
         move_folder(folder, destination)
@@ -644,9 +647,9 @@ def update_folder(folder_id):
 def copy_folder_api(folder_id):
     data = _body()
     folder = get_folder(folder_id)
-    _need("download", folder)
+    _need("item.copy", folder)
     destination = get_folder(data.get("parent_id"))
-    _need("upload", destination)
+    _need("folder.create_child", destination)
     report = {}
     copied = copy_folder(folder, destination, g.user, res=resolver(), report=report)
     # skipped = items inside the folder that the user may not read, which were left out.
@@ -658,11 +661,8 @@ def copy_folder_api(folder_id):
 def update_folder_retention(folder_id):
     from ..services.activity import diff, log_activity
     folder = get_folder(folder_id)
-    if not g.user.has("records") and not g.user.is_admin:
-        abort(403)
-    # The capability alone is not enough: version pruning destroys content, so the caller must also
-    # manage this folder (an administrator has no access to other users' folders).
-    _need("manage", folder)
+    # Retention, legal hold, versioning and system settings are Admin only (admin.policy).
+    policy.require_system("admin.policy")
     data = _body()
 
     def retention_value(name):
@@ -685,7 +685,7 @@ def update_folder_retention(folder_id):
 @api_auth
 def remove_folder(folder_id):
     folder = get_folder(folder_id)
-    _need("delete", folder)
+    _need("item.delete", folder)
     # Checks delete permission on every subfolder and every document inside.
     delete_folder(folder, g.user, res=resolver())
     return jsonify(ok=True)
@@ -695,8 +695,7 @@ def remove_folder(folder_id):
 @api_auth
 def restore_folder_api(folder_id):
     folder = get_folder(folder_id, include_deleted=True)
-    if not can_manage_trashed(folder, g.user, resolver()):
-        abort(403)
+    _need("item.restore", folder)
     restore_folder(folder, user=g.user)
     return jsonify(ok=True, folder=_folder_json(folder))
 
@@ -705,8 +704,7 @@ def restore_folder_api(folder_id):
 @api_auth
 def purge_folder_api(folder_id):
     folder = get_folder(folder_id, include_deleted=True)
-    if not can_manage_trashed(folder, g.user, resolver()):
-        abort(403)
+    _need("item.purge", folder)
     purge_folder(folder, reason="permanently deleted through the API")
     return jsonify(ok=True)
 
@@ -735,7 +733,7 @@ def _history_row_visible(row):
 @api_auth
 def folder_history(folder_id):
     folder = get_folder(folder_id)
-    _need("view", folder)
+    _need("item.view", folder)
     rows = db.session.execute(
         select(FolderActivity).where(FolderActivity.folder_id == folder.id)
         .order_by(FolderActivity.created_at.desc(), FolderActivity.id.desc())
@@ -795,7 +793,7 @@ def documents():
 @api_auth
 def document(doc_id):
     doc = svc.get_document(doc_id)
-    _need("view", doc)
+    _need("item.view", doc)
     log_activity("document", "viewed", f"Opened '{doc.name}'", doc.id, entity_name=doc.name)
     svc.record_view(doc, g.user)  # feeds /recent (FR-FLD-04); commits the audit entry too
     cv = doc.current_version
@@ -817,7 +815,7 @@ def document(doc_id):
 @api_auth
 def content(doc_id):
     doc = svc.get_document(doc_id)
-    _need("download", doc)
+    _need("item.download", doc)
     raw_number = request.args.get("version")
     number = _integer(raw_number, "version", 1) if raw_number else None
     version = svc.get_version(doc, number) if number else doc.current_version
@@ -859,7 +857,7 @@ def _readable_version(doc, perm):
 def preview_document(doc_id):
     """Inline content for PDF, image, text, video and audio; Office files as a PDF rendition (FR-DOC-03)."""
     doc = svc.get_document(doc_id)
-    _need("view", doc)
+    _need("item.view", doc)
     version = _readable_version(doc, "view")
     view_only = "download" not in resolver().version(version)
     if view_only and request.headers.get("Sec-Fetch-Dest") == "document":
@@ -890,7 +888,7 @@ def preview_document(doc_id):
 def render_document(doc_id):
     """Sanitised standalone HTML rendering of an Office file (show it in a sandboxed iframe)."""
     doc = svc.get_document(doc_id)
-    _need("view", doc)
+    _need("item.view", doc)
     version = _readable_version(doc, "view")
     html_doc = html_rendition(version)
     if html_doc is None:
@@ -903,7 +901,7 @@ def render_document(doc_id):
 def compare_document_versions(doc_id):
     """Side-by-side rows and a redline of two versions (FR-VER-03). Defaults to the latest two."""
     doc = svc.get_document(doc_id)
-    _need("view", doc)
+    _need("item.view", doc)
     numbers = sorted(v.version_number for v in doc.versions if "view" in resolver().version(v))
     if len(numbers) < 2:
         raise ValidationError("At least two versions are needed for a comparison.")
@@ -925,7 +923,7 @@ def compare_document_versions(doc_id):
 def upload():
     form = _body()
     folder = get_folder(form.get("folder_id"))
-    _need("upload", folder)
+    _need("folder.upload", folder)
     files = [f for f in request.files.getlist("file") if f.filename]
     if not files:
         raise ValidationError("Choose a file to upload.")
@@ -978,7 +976,7 @@ def upload():
 @api_auth
 def new_version(doc_id):
     doc = svc.get_document(doc_id)
-    _need("edit", doc)
+    _need("item.version.create", doc)
     form = _body()
     version, created = svc.add_version(doc, request.files.get("file"), form.get("idempotency_key"),
                                        form.get("note"), user=g.user, major=form.get("major") in ("1", "true", True),
@@ -990,7 +988,7 @@ def new_version(doc_id):
 @api_auth
 def checkout(doc_id):
     doc = svc.get_document(doc_id)
-    _need("edit", doc)
+    _need("item.version.create", doc)
     svc.checkout(doc, g.user)
     return jsonify(ok=True, document=_doc_json(doc))
 
@@ -999,7 +997,7 @@ def checkout(doc_id):
 @api_auth
 def checkin(doc_id):
     doc = svc.get_document(doc_id)
-    _need("edit", doc)
+    _need("item.version.create", doc)
     form = _body()
     version = svc.checkin(doc, g.user, request.files.get("file"), form.get("note"),
                           major=form.get("major") in ("1", "true", True), idempotency_key=form.get("idempotency_key"),
@@ -1011,7 +1009,7 @@ def checkin(doc_id):
 @api_auth
 def delete(doc_id):
     doc = svc.get_document(doc_id)
-    _need("delete", doc)
+    _need("item.delete", doc)
     svc.trash_document(doc, g.user)
     return jsonify(ok=True)
 
@@ -1021,7 +1019,7 @@ def delete(doc_id):
 def update_document(doc_id):
     data = _body()
     doc = svc.get_document(doc_id)
-    _need("edit", doc)
+    _need("item.view", doc)
     # Optimistic locking: a client that sends the row_version it loaded gets 409 instead of
     # overwriting a change someone else saved in the meantime.
     if data.get("row_version") not in (None, ""):
@@ -1030,14 +1028,21 @@ def update_document(doc_id):
             raise ConflictError(f"'{doc.name}' was changed by someone else since you opened it. "
                                 "Reload it to see the latest details, then make your change again.",
                                 row_version=doc.row_version)
+    meta_change = "document_type_id" in data or "tags" in data or any(key.startswith("meta_") for key in data)
+    if "name" in data:
+        _need("item.rename", doc)
+    if "folder_id" in data:
+        _need("item.move", doc)
+    if meta_change:
+        _need("item.metadata.edit", doc)
     if "name" in data:
         svc.rename_document(doc, data.get("name", ""), g.user)
     if "folder_id" in data:
-        _need("delete", doc)
+        _need("item.move", doc)
         folder = get_folder(data.get("folder_id"))
-        _need("upload", folder)
+        _need("folder.upload", folder)
         svc.move_document(doc, folder, g.user)
-    if "document_type_id" in data or "tags" in data or any(key.startswith("meta_") for key in data):
+    if meta_change:
         if "document_type_id" not in data and doc.document_type_id is not None:
             data.add("document_type_id", str(doc.document_type_id))
         if "tags" not in data:
@@ -1058,11 +1063,11 @@ def update_document(doc_id):
 def copy_document_api(doc_id):
     data = _body()
     doc = svc.get_document(doc_id)
-    _need("download", doc)
+    _need("item.copy", doc)
     if doc.current_version is not None:
-        _need("download", doc.current_version)  # a copy hands out the content: respect version-level limits
+        _need("item.download", doc.current_version)  # a copy hands out the content: respect version-level limits
     destination = get_folder(data.get("folder_id"))
-    _need("upload", destination)
+    _need("folder.upload", destination)
     copied = svc.copy_document(doc, destination, g.user)
     return jsonify(ok=True, document=_doc_json(copied)), 201
 
@@ -1071,10 +1076,10 @@ def copy_document_api(doc_id):
 @api_auth
 def restore_document_version(doc_id, number):
     doc = svc.get_document(doc_id)
-    _need("edit", doc)
+    _need("item.version.restore", doc)
     version = svc.get_version(doc, number)
     # Restoring re-publishes that version's content as the current one, so it needs download, not just view.
-    _need("download", version)
+    _need("item.download", version)
     form = _body()
     restored, created = svc.restore_version(
         doc, number, form.get("idempotency_key"), user=g.user,
@@ -1089,8 +1094,7 @@ def restore_document_version(doc_id, number):
 @api_auth
 def restore_document_api(doc_id):
     doc = svc.get_document(doc_id, include_deleted=True)
-    if not can_manage_trashed(doc, g.user, resolver()):
-        abort(403)
+    _need("item.restore", doc)
     svc.restore_document(doc, user=g.user)
     return jsonify(ok=True, document=_doc_json(doc))
 
@@ -1099,8 +1103,7 @@ def restore_document_api(doc_id):
 @api_auth
 def purge_document_api(doc_id):
     doc = svc.get_document(doc_id, include_deleted=True)
-    if not can_manage_trashed(doc, g.user, resolver()):
-        abort(403)
+    _need("item.purge", doc)
     svc.purge_document(doc, reason="permanently deleted through the API")
     return jsonify(ok=True)
 
@@ -1110,12 +1113,12 @@ def purge_document_api(doc_id):
 def release_document(doc_id):
     """Discard a check-out. Records managers (or users who manage the document) may break another user's lock."""
     doc = svc.get_document(doc_id)
-    _need("view", doc)
+    _need("item.view", doc)
     force = doc.checked_out_by_id not in (None, g.user.id)
-    if force and not (g.user.has("records") or resolver().can("manage", doc)):
+    if force and not (g.user.has("records") or policy.can(g.user, "item.share", doc)):
         abort(403, description="Only records managers can release another user's check-out.")
     if not force:
-        _need("edit", doc)
+        _need("item.version.create", doc)
     svc.release(doc, g.user, force=force)
     return jsonify(ok=True, document=_doc_json(doc))
 
@@ -1125,9 +1128,9 @@ def release_document(doc_id):
 def add_document_link(doc_id):
     data = _body()
     doc = svc.get_document(doc_id)
-    _need("view", doc)
+    _need("item.view", doc)
     folder = get_folder(data.get("folder_id"))
-    _need("upload", folder)
+    _need("folder.upload", folder)
     link = svc.add_link(doc, folder, g.user)
     return jsonify(ok=True, link_id=link.id), 201
 
@@ -1138,7 +1141,7 @@ def remove_document_link(link_id):
     link = db.session.get(DocumentLink, link_id)
     if link is None:
         raise NotFound("Shortcut not found.")
-    _need("edit", link.folder)
+    _need("folder.upload", link.folder)
     svc.remove_link(link)
     return jsonify(ok=True)
 
@@ -1215,7 +1218,7 @@ def metadata_schema():
     """Fields, document types and tags that apply to an upload into a folder (FR-MET-01, FR-MET-02)."""
     from ..services import settings
     folder = get_folder(request.args.get("folder_id"))
-    _need("view", folder)
+    _need("item.view", folder)
     return jsonify(fields=meta_svc.schema_json(folder, _query_integer("document_type_id")),
                    types=[{"id": t.id, "name": t.name, "description": t.description}
                           for t in meta_svc.document_types()],
@@ -1259,12 +1262,67 @@ def emails():
                    page=page, per_page=per_page)
 
 
-def _own_email(email_id):
-    """The email if it is in the signed-in user's own archive; 404 otherwise, so others' ids are not revealed."""
-    record = email_svc.owned_email(g.user, email_id)
+def _email_for(email_id, need="view"):
+    """The email if it is in the signed-in user's own archive or was shared with them (Permissions Matrix
+    5); 404 otherwise, so others' ids are not revealed. Administrators get no access without a share."""
+    record, perms = email_svc.accessible_email(g.user, email_id)
     if record is None:
         raise NotFound("Email not found.")
+    if need not in perms:
+        abort(403, description="You have view-only access to this email.")
+    g.email_perms = perms
     return record
+
+
+def _own_email(email_id):
+    return _email_for(email_id, "view")
+
+
+@bp.get("/emails/shared")
+@api_auth
+def emails_shared_with_me():
+    """Archived emails other users shared with the signed-in user."""
+    rows = email_svc.shared_with(g.user)
+    out = []
+    for record in rows:
+        data = _email_json(record)
+        perms = email_svc.email_perms(g.user, record)
+        owner = record.account.user if record.account is not None else None
+        data.update(access=sorted(perms), owner=owner.label if owner else None)
+        out.append(data)
+    return jsonify(emails=out, total=len(out))
+
+
+@bp.get("/emails/<int:email_id>/shares")
+@api_auth
+def email_share_list(email_id):
+    record = _email_for(email_id, "share")
+    return jsonify(levels=[{"key": k, "label": v[0]} for k, v in email_svc.EMAIL_SHARE_LEVELS.items()],
+                   shares=[{"id": e.id, "principal_type": e.principal_type, "principal_id": e.principal_id,
+                            "principal": access_svc.principal_label(e),
+                            "level": "download" if "download" in e.permission_set else "view",
+                            "expires_at": _iso(e.expires_at), "expired": e.is_expired}
+                           for e in email_svc.email_shares(record)])
+
+
+@bp.post("/emails/<int:email_id>/shares")
+@api_auth
+def email_share(email_id):
+    """The owner shares an archived email (View or Download) with an active DMS user or a group."""
+    record = _email_for(email_id, "share")
+    data = _body()
+    email_svc.share_email(record, data.get("principal_type") or "user",
+                          _integer(data.get("principal_id"), "principal_id", 1), data.get("level") or "view",
+                          g.user, expires_at=access_svc.parse_expiry(data.get("expires_at")))
+    return jsonify(ok=True), 201
+
+
+@bp.delete("/emails/<int:email_id>/shares/<int:entry_id>")
+@api_auth
+def email_unshare(email_id, entry_id):
+    record = _email_for(email_id, "share")
+    email_svc.unshare_email(record, entry_id)
+    return jsonify(ok=True)
 
 
 @bp.get("/emails/<int:email_id>")
@@ -1277,7 +1335,9 @@ def email_detail(email_id):
         inline = email_svc.inline_part_indexes(email_svc.load_message(record))
     except FileNotFoundError:
         inline = None  # original file missing: fall back to what was recorded at archive time
-    return jsonify(email=_email_json(record, inline))
+    data = _email_json(record, inline)
+    data.update(access=sorted(g.email_perms), is_owner="share" in g.email_perms)
+    return jsonify(email=data)
 
 
 @bp.get("/emails/<int:email_id>/body")
@@ -1306,7 +1366,7 @@ def email_body(email_id):
 @bp.get("/emails/<int:email_id>/eml")
 @api_auth
 def email_eml(email_id):
-    record = _own_email(email_id)
+    record = _email_for(email_id, "download")
     name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", record.subject or "").strip(" .")[:80] or "message"
     if request.args.get("with_images") == "1":
         # A copy with the linked images embedded, so it shows them in any mail program, even offline.
@@ -1325,7 +1385,7 @@ def email_eml(email_id):
 @bp.get("/emails/<int:email_id>/attachments/<int:part_index>")
 @api_auth
 def email_attachment(email_id, part_index):
-    record = _own_email(email_id)
+    record = _email_for(email_id, "download")
     if record.scan_status == "infected":
         abort(403, description="This email was flagged as containing malware; its attachments cannot be downloaded.")
     attachment = db.session.execute(select(EmailAttachment).where(
@@ -1392,7 +1452,7 @@ def import_email_attachment():
     data = _body()
     email_id = _integer(data.get("email_id"), "email_id", 1)
     part_index = _integer(data.get("part_index"), "part_index", 0)
-    record = _own_email(email_id)
+    record = _email_for(email_id, "download")
     if record.scan_status == "infected":
         raise ValidationError("This email was flagged as containing malware; its attachments cannot be imported.")
     attachment = db.session.execute(select(EmailAttachment).where(
@@ -1404,7 +1464,7 @@ def import_email_attachment():
     if not content:
         raise ValidationError("The attachment is empty or could not be read from the original message.")
     folder = get_folder(data.get("folder_id"))
-    _need("upload", folder)
+    _need("folder.upload", folder)
     file = FileStorage(stream=io.BytesIO(content), filename=attachment.filename)
     subject = (record.subject or "(no subject)")[:200]
     doc, created, version = svc.upload_document(
@@ -1443,10 +1503,10 @@ def favourites():
 def add_favourite(kind, target_id):
     if kind == "folder":
         item = get_folder(target_id)
-        _need("view", item)
+        _need("item.view", item)
     elif kind == "document":
         item = svc.get_document(target_id)
-        _need("view", item)
+        _need("item.view", item)
     else:
         raise ValidationError("Favourite type must be folder or document.")
     existing = db.session.execute(select(Favourite).where(
@@ -1501,7 +1561,7 @@ def shared_items():
         item = _shared_target(entry)
         # The home-folder check only applies to folders: document and folder ids come from
         # different tables, so comparing a document id with home_folder_id hid real shares.
-        if item is None or item.created_by_id == g.user.id \
+        if item is None or item.owner_id == g.user.id \
                 or (entry.target_type == "folder" and item.id == g.user.home_folder_id) \
                 or "view" not in resolver().perms(item):
             continue
@@ -1555,25 +1615,56 @@ def shared_items():
 @bp.get("/recycle-bin")
 @api_auth
 def recycle_bin():
-    folders, documents = recycle_bin_items(g.user, resolver())
+    """Owners see their own deleted items (restorable within the retention window); administrators see
+    every deleted item and are the only ones who can permanently delete (Permissions Matrix 6)."""
+    res = resolver()
+    folders, documents = recycle_bin_items(g.user, res)
+
+    def row(item, data):
+        data.update(can_restore=policy.decide(res, "item.restore", item)[0],
+                    can_purge=policy.decide(res, "item.purge", item)[0],
+                    legal_hold=bool(item.legal_hold))
+        return data
+
     return jsonify(
-        folders=[_folder_json(item) for item in folders],
-        documents=[_doc_json(item) for item in documents],
+        folders=[row(item, _folder_json(item)) for item in folders],
+        documents=[row(item, _doc_json(item)) for item in documents],
+        can_purge=res.is_admin,
     )
 
 
 @bp.delete("/recycle-bin")
 @api_auth
 def empty_recycle_bin():
+    _need("item.purge", None, "Only an administrator can permanently delete items.")
     folders, documents = recycle_bin_items(g.user, resolver())
+    purged_folders = purged_documents = held = 0
     for folder in folders:
-        if db.session.get(Folder, folder.id) is not None:
-            purge_folder(folder, reason="recycle bin emptied through the API")
+        if db.session.get(Folder, folder.id) is None:
+            continue
+        if policy.under_hold(folder):
+            held += 1
+            continue
+        purge_folder(folder, reason="recycle bin emptied through the API")
+        purged_folders += 1
     for document in documents:
-        if db.session.get(Document, document.id) is not None:
-            svc.purge_document(document, reason="recycle bin emptied through the API")
+        if db.session.get(Document, document.id) is None:
+            continue
+        if policy.under_hold(document):
+            held += 1
+            continue
+        svc.purge_document(document, reason="recycle bin emptied through the API")
+        purged_documents += 1
     db.session.commit()
-    return jsonify(ok=True, purged_folders=len(folders), purged_documents=len(documents))
+    return jsonify(ok=True, purged_folders=purged_folders, purged_documents=purged_documents, kept_on_hold=held)
+
+
+def _owner_json(item):
+    if item is None:
+        return None
+    owner = item.document.owner if isinstance(item, DocumentVersion) else item.owner
+    return {"id": owner.id, "username": owner.username, "label": owner.label,
+            "active": bool(owner.is_active)} if owner else None
 
 
 @bp.get("/permissions/<kind>/<int:obj_id>")
@@ -1581,13 +1672,12 @@ def empty_recycle_bin():
 @api_auth
 def permissions(kind, obj_id, number=None):
     target = _target(kind, obj_id, number)
-    _need("view", target)
+    _need("item.view", target)
     entries = []
-    res = resolver()
-    # Who has access is visible only to people who may share or manage the item; others get their own
-    # effective permissions and nothing else.
-    may_see_entries = res.can("share", target) or res.can("manage", target)
-    for entry in (access_svc.entries_for(target) if may_see_entries else []):
+    # Who has access is visible only to people who may share the item (its owner and administrators);
+    # others get their own effective permissions and nothing else.
+    may_share = policy.can(g.user, "item.share", target)
+    for entry in (access_svc.entries_for(target) if may_share else []):
         entries.append({
             "id": entry.id,
             "principal_type": entry.principal_type,
@@ -1600,9 +1690,20 @@ def permissions(kind, obj_id, number=None):
             "expired": entry.is_expired,
         })
     return jsonify(permissions=sorted(resolver().perms(target)),
-                   can_manage=resolver().can("manage", target),
+                   actions=policy.actions_for(target),
+                   can_manage=may_share, can_share=may_share,
+                   owner=_owner_json(target),
+                   legal_hold=bool(getattr(target, "legal_hold", False)) if target is not None else False,
                    inherit_permissions=getattr(target, "inherit_permissions", None),
                    entries=entries)
+
+
+def _need_share(target):
+    """Changing who has access: the item's owner or an administrator; the whole repository: Admin."""
+    if target is None:
+        policy.require_system("admin.users")
+    else:
+        _need("item.share", target)
 
 
 @bp.post("/permissions/<kind>/<int:obj_id>/grant")
@@ -1611,19 +1712,21 @@ def permissions(kind, obj_id, number=None):
 def grant_permissions(kind, obj_id, number=None):
     data = _body()
     target = _target(kind, obj_id, number)
-    _need("manage", target)
+    _need_share(target)
     principal_type = data.get("principal_type")
     principal_id = _integer(data.get("principal_id"), "principal_id", 1)
     permissions_value = data.getlist("permissions")
     if len(permissions_value) == 1 and isinstance(permissions_value[0], str):
         permissions_value = [part.strip() for part in permissions_value[0].split(",") if part.strip()]
     perms = [perm for perm in CONTENT_PERMS if perm in permissions_value]
-    if target is None and principal_type == "user" and principal_id == g.user.id and "manage" not in perms \
-            and not g.user.is_admin:
-        raise ValidationError("You cannot remove your own permission to manage the repository.")
+    if target is not None:
+        # Shares give at most Edit (Permissions Matrix 2); delete/share/manage stay with the owner and Admin.
+        perms = [perm for perm in perms if perm in access_svc.SHAREABLE]
     expires_at = access_svc.parse_expiry(data.get("expires_at"))
     if target is None and expires_at is not None:
         raise ValidationError("Repository-wide permissions cannot have an end date.")
+    if principal_type == "user" and perms:
+        access_svc._require_active("user", principal_id)
     access_svc.set_entry(target, principal_type, principal_id, perms, g.user, expires_at=expires_at)
     return jsonify(ok=True, permissions=sorted(resolver().perms(target)))
 
@@ -1633,7 +1736,7 @@ def grant_permissions(kind, obj_id, number=None):
 @api_auth
 def remove_permission(kind, obj_id, entry_id, number=None):
     target = _target(kind, obj_id, number)
-    _need("manage", target)
+    _need_share(target)
     access_svc.remove_entry(target, entry_id)
     return jsonify(ok=True)
 
@@ -1644,7 +1747,7 @@ def remove_permission(kind, obj_id, entry_id, number=None):
 def update_inheritance(kind, obj_id, number=None):
     data = _body()
     target = _target(kind, obj_id, number)
-    _need("manage", target)
+    _need_share(target)
     inherit = str(data.get("inherit", "")).lower() in ("1", "true", "yes")
     copy_inherited = str(data.get("copy", "1")).lower() not in ("0", "false", "no")
     access_svc.set_inheritance(target, inherit, copy_inherited=copy_inherited, actor=g.user)
@@ -1655,19 +1758,17 @@ def update_inheritance(kind, obj_id, number=None):
 @bp.post("/permissions/<kind>/<int:obj_id>/<int:number>/share")
 @api_auth
 def share_item(kind, obj_id, number=None):
+    """Share with a DMS user (or a group role) at View, Download or Edit. Owner and Admin only."""
     data = _body()
     target = _target(kind, obj_id, number)
+    if target is None:
+        raise ValidationError("Use repository permissions to grant access to the whole library.")
+    _need("item.share", target)
     actor_perms = resolver().perms(target)
-    if "share" not in actor_perms and "manage" not in actor_perms:
-        from ..services.activity import log_denied
-        log_denied("share", target, target is None or "view" in actor_perms)
-        abort(403)
     principal_type = data.get("principal_type") or "user"
     if principal_type not in ("user", "role"):
         raise ValidationError("Choose a user or a group.")
     principal_id = _integer(data.get("principal_id"), "principal_id", 1)
-    if target is None:
-        raise ValidationError("Use repository permissions to grant access to the whole library.")
     expires_at = access_svc.parse_expiry(data.get("expires_at"))
     if data.get("level"):
         access_svc.share_level(target, actor_perms, principal_id, data.get("level"), g.user,
@@ -1766,12 +1867,17 @@ def recent_versions():
 @api_auth
 def activity():
     from ..models import ActivityLog
-    # The audit log is personal: every signed-in user (administrators included) sees only the
-    # entries for actions they performed themselves, never other users' activity.
+    # Contributors see only the entries for actions they performed themselves. Administrators see the
+    # whole audit log (admin.audit, Permissions Matrix 3) and may filter it by user (``user_id``).
     # Read-only: the audit log has no endpoint that changes or deletes entries.
     page = max(1, request.args.get("page", 1, type=int))
     per_page = min(100, max(1, request.args.get("per_page", 50, type=int)))
-    own = ActivityLog.user_id == g.user.id
+    if policy.can(g.user, "admin.audit"):
+        own = ActivityLog.id.is_not(None)
+        if request.args.get("user_id"):
+            own = ActivityLog.user_id == _integer(request.args.get("user_id"), "user_id", 1)
+    else:
+        own = ActivityLog.user_id == g.user.id
     stmt = select(ActivityLog).where(own)
     args = request.args
     for name, column in (("category", ActivityLog.category), ("action", ActivityLog.action),
@@ -1958,6 +2064,8 @@ def admin_update_user(user_id):
         user.failed_logins, user.locked_until = 0, None
     elif action == "save":
         was_admin = user.is_admin
+        was_active = bool(user.is_active)
+        old_role_ids = {role.id for role in user.roles}
         defaults = {
             "display_name": user.display_name,
             "email": user.email or "",
@@ -1971,10 +2079,23 @@ def admin_update_user(user_id):
             data.setlist("roles", [str(role.id) for role in user.roles])
         apply_user_data(user, data, creating=False)
         db.session.flush()
+        if user.id == g.user.id and {role.id for role in user.roles} != old_role_ids:
+            raise ValidationError("You cannot change your own role.")
+        if user.id == g.user.id and was_active and not user.is_active:
+            raise ValidationError("You cannot deactivate your own account.")
         if was_admin and (not user.is_admin or not user.is_active):
             admins = db.session.execute(select(User).where(User.is_active.is_(True))).scalars().all()
             if not any(other.id != user.id and other.is_admin for other in admins):
                 raise ValidationError("At least one active administrator must remain.")
+        from ..services import lifecycle
+        if was_active and not user.is_active:
+            summary = lifecycle.deactivate(user)
+            log_activity("admin", "user_deactivated", f"User '{user.username}' deactivated", user.id,
+                         entity_type="user", entity_name=user.username, details=summary)
+        elif not was_active and user.is_active:
+            lifecycle.reactivate(user)
+            log_activity("admin", "user_reactivated", f"User '{user.username}' reactivated", user.id,
+                         entity_type="user", entity_name=user.username)
     else:
         raise ValidationError("Unknown user action.")
     log_activity("admin", "user_updated", f"User '{user.username}' updated", user.id, entity_type="user",
@@ -2130,6 +2251,8 @@ def admin_add_role_members(role_id):
     users = db.session.execute(select(User).where(User.id.in_(ids))).scalars().all()
     if len(users) != len(set(ids)):
         raise NotFound("User not found.")
+    if g.user.id in ids:
+        raise ValidationError("You cannot change your own role.")
     added = [u for u in users if role not in u.roles]
     for user in added:
         user.roles.append(role)
@@ -2151,6 +2274,8 @@ def admin_remove_role_member(role_id, user_id):
         raise NotFound("Role or user not found.")
     if role not in user.roles:
         raise NotFound("The user is not a member of this role.")
+    if user.id == g.user.id:
+        raise ValidationError("You cannot change your own role.")
     was_admin = user.is_admin
     user.roles.remove(role)
     db.session.flush()
@@ -2522,3 +2647,119 @@ def admin_gmail_accounts():
         "status": r["last_sync_status"], "error": r["last_error"], "archived_total": int(r["archived_total"]),
         "pending": int(r["pending"]), "failed": int(r["failed"]),
     } for r in rows], total=int(rows[0]["total"]) if rows else 0, page=page, per_page=per_page)
+
+
+@bp.post("/admin/gmail/accounts/<int:account_id>/disconnect")
+@api_auth
+def admin_gmail_disconnect(account_id):
+    """Disable/unlink any user's mailbox link (email.manage_any). Revokes the token; no content access."""
+    from ..gmail.sync import admin_disconnect
+    policy.require_system("email.manage_any")
+    account = db.session.get(GmailAccount, account_id)
+    if account is None:
+        raise NotFound("Mailbox not found.")
+    was_active = admin_disconnect(account)
+    return jsonify(ok=True, disconnected=was_active)
+
+
+# ------------------------------------------------------------------- ownership and legal hold (Admin)
+
+@bp.post("/admin/ownership/reassign")
+@api_auth
+def admin_reassign_ownership():
+    """Reassign ownership (admin.ownership): ``items`` [{type, id}] or ``from_user_id`` (everything that
+    user owns), to ``to_user_id`` (an active user or a holding account)."""
+    from ..services import lifecycle
+    policy.require_system("admin.ownership")
+    data = request.get_json(silent=True) or {}
+    to_user = db.session.get(User, _integer(data.get("to_user_id"), "to_user_id", 1))
+    if to_user is None:
+        raise NotFound("User not found.")
+    if data.get("from_user_id"):
+        source = db.session.get(User, _integer(data.get("from_user_id"), "from_user_id", 1))
+        if source is None:
+            raise NotFound("User not found.")
+        if source.id == to_user.id:
+            raise ValidationError("Choose a different user to receive the items.")
+        items = lifecycle.owned_by(source)
+    else:
+        raw = data.get("items") or []
+        if not isinstance(raw, list) or not raw:
+            raise ValidationError("Choose at least one item, or a user whose items to reassign.")
+        items = [(str(item.get("type")), _integer(item.get("id"), "id", 1)) for item in raw if isinstance(item, dict)]
+    changed = lifecycle.reassign(items, to_user, g.user)
+    return jsonify(ok=True, reassigned=changed, count=len(changed))
+
+
+@bp.get("/admin/legal-holds")
+@api_auth
+def admin_legal_holds():
+    from ..services import lifecycle
+    policy.require_system("admin.policy")
+    folders, docs = lifecycle.holds()
+    return jsonify(folders=[{"id": f.id, "name": f.name, "path": f.path, "owner": f.owner.username if f.owner else None}
+                            for f in folders],
+                   documents=[{"id": d.id, "name": d.name, "folder_id": d.folder_id,
+                               "owner": d.owner.username if d.owner else None} for d in docs])
+
+
+@bp.put("/admin/legal-hold/<kind>/<int:item_id>")
+@api_auth
+def admin_set_legal_hold(kind, item_id):
+    """Place (``hold: true``) or release a legal hold on a folder or document (admin.policy)."""
+    from ..services import lifecycle
+    policy.require_system("admin.policy")
+    data = _body()
+    hold = str(data.get("hold", "")).lower() in ("1", "true", "yes", "on")
+    item = lifecycle.set_legal_hold(kind, item_id, hold, (data.get("reason") or "").strip()[:300])
+    return jsonify(ok=True, legal_hold=bool(item.legal_hold))
+
+
+# ------------------------------------------------------------------- short-lived signed download links
+
+def _link_serializer():
+    from itsdangerous import URLSafeTimedSerializer
+    return URLSafeTimedSerializer(current_app.config["SECRET_KEY"], salt="dms-download-link")
+
+
+@bp.get("/documents/<int:doc_id>/download-link")
+@api_auth
+def document_download_link(doc_id):
+    """A short-lived signed URL for one version, issued only after the permission check (Permissions
+    Matrix 9.10). The link is checked again when used, so revoked access stops it working."""
+    from ..services import settings
+    doc = svc.get_document(doc_id)
+    _need("item.download", doc)
+    raw_number = request.args.get("version")
+    version = svc.get_version(doc, _integer(raw_number, "version", 1)) if raw_number else doc.current_version
+    if version is None:
+        raise NotFound("Document version not found.")
+    _need("item.download", version)
+    token = _link_serializer().dumps({"u": g.user.id, "d": doc.id, "v": version.id})
+    seconds = settings.get("download_link_seconds")
+    return jsonify(url=url_for("api.signed_download", token=token), expires_in=seconds)
+
+
+@bp.get("/dl/<token>")
+def signed_download(token):
+    from itsdangerous import BadSignature
+    from ..security.permissions import Resolver
+    from ..services import settings
+    try:
+        data = _link_serializer().loads(token, max_age=settings.get("download_link_seconds"))
+    except BadSignature:  # includes SignatureExpired
+        abort(404, description="This download link is invalid or has expired.")
+    user = db.session.get(User, data.get("u"))
+    doc = db.session.get(Document, data.get("d"))
+    version = db.session.get(DocumentVersion, data.get("v"))
+    if user is None or doc is None or version is None or doc.deleted_at is not None \
+            or version.document_id != doc.id:
+        abort(404, description="This download link is invalid or has expired.")
+    res = Resolver(user)
+    if not (policy.decide(res, "item.download", doc)[0] and policy.decide(res, "item.download", version)[0]):
+        abort(404, description="This download link is invalid or has expired.")
+    g.user = user
+    log_activity("document", "downloaded", f"Downloaded '{doc.name}' (version {version.label}) via a signed link",
+                 doc.id, entity_name=doc.name, details={"version": version.label, "signed_link": True})
+    db.session.commit()
+    return stream_stored(version.storage_key, version.mime_type, doc.name, as_attachment=True, etag=version.sha256)

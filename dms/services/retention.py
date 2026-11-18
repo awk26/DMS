@@ -17,6 +17,11 @@ def recycle_expiry(deleted_at):
     return deleted_at + timedelta(days=settings.get("recycle_bin_days")) if deleted_at else None
 
 
+def under_hold(item):
+    from ..security.policy import under_hold as held
+    return held(item)
+
+
 def purge_expired_recycle_bin():
     """Permanently delete recycle-bin items older than the configured retention period."""
     from .documents import purge_document
@@ -30,10 +35,14 @@ def purge_expired_recycle_bin():
             continue
         if folder.parent is not None and folder.parent.deleted_at is not None:
             continue  # handled with its parent
+        if under_hold(folder):
+            continue  # legal hold blocks purge, also when the retention period has ended
         purge_folder(folder, reason="recycle bin retention expired")
         purged += 1
     for doc in db.session.execute(select(Document).where(Document.deleted_at.is_not(None),
                                                          Document.deleted_at < cutoff)).scalars().all():
+        if db.session.get(Document, doc.id) is None or under_hold(doc):
+            continue
         purge_document(doc, reason="recycle bin retention expired")
         purged += 1
     return purged
@@ -83,6 +92,8 @@ def apply_version_retention():
     from .documents import delete_stored
     removed = 0
     for doc in db.session.execute(select(Document).where(Document.deleted_at.is_(None))).scalars().all():
+        if under_hold(doc):
+            continue  # nothing of a document under legal hold is destroyed
         prune = versions_to_prune(doc)
         if not prune:
             continue

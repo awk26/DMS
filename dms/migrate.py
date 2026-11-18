@@ -75,6 +75,21 @@ def _backfill():
         conn.execute(text("UPDATE document_versions SET major = version_number, minor = 0 WHERE major IS NULL"))
 
 
+def _owners():
+    """Permissions Matrix v2: every existing folder and document is owned by the user who created it.
+    Runs once (a setting records it) so later reassignments by an administrator are never undone."""
+    from .services import settings
+    if settings.get("owner_backfill_done"):
+        return
+    with db.engine.begin() as conn:
+        for table in ("folders", "documents"):
+            conn.execute(text(f"UPDATE {table} SET owner_id = created_by_id "
+                              "WHERE owner_id IS NULL AND created_by_id IS NOT NULL"))
+    settings.set_value("owner_backfill_done", True)
+    db.session.commit()
+    log.info("Permissions Matrix upgrade: owners set from the creators of existing folders and documents")
+
+
 def _admin_owner_grants():
     """Give administrators an explicit owner grant on folders and documents they created.
 
@@ -162,6 +177,7 @@ def upgrade(app):
     _audit_objects()
     _backfill()
     ensure_predefined_roles()
+    _owners()
     _admin_owner_grants()
     _restricted_repository()
     # Index existing content the first time search is available.

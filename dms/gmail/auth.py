@@ -130,3 +130,23 @@ def console_authorize():
     creds_path, scopes = _cfg()
     flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), scopes)
     return flow.run_local_server(port=0)
+
+
+def revoke_token(token_enc):
+    """Revoke a stored OAuth token at Google when a mailbox is unlinked (Permissions Matrix 5).
+    Best effort: unlinking always succeeds locally even if Google cannot be reached.
+    Set GMAIL_REVOKE_TOKENS = False to skip the network call (e.g. in tests)."""
+    if not token_enc or not current_app.config.get("GMAIL_REVOKE_TOKENS", True):
+        return False
+    try:
+        data = json.loads(unseal(token_enc))
+        token = data.get("refresh_token") or data.get("token")
+        if not token:
+            return False
+        import requests
+        response = requests.post("https://oauth2.googleapis.com/revoke", params={"token": token},
+                                 headers={"content-type": "application/x-www-form-urlencoded"}, timeout=10)
+        return response.status_code == 200
+    except Exception:
+        log.warning("Could not revoke a Gmail token at Google", exc_info=True)
+        return False

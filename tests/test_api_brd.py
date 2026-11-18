@@ -203,10 +203,10 @@ def test_doc04_check_out_prevents_concurrent_overwrite(api, app, contributor):
     records = Api(app, make_user("rm", ("Records Manager",)))
     doc = contributor.doc("shared.txt", b"v1")
     assert contributor.post(f"/documents/{doc}/checkout").json["document"]["checked_out_by"] == "carl"
-    # The administrator has no access to a user's document at all (privacy); someone with edit is blocked by the lock.
-    assert api.version(doc, "shared.txt", b"v2 by admin").status_code in (403, 404)
-    assert records.version(doc, "shared.txt", b"v2 by records").status_code == 400
-    assert records.patch(f"/documents/{doc}", {"name": "renamed.txt"}).status_code == 400
+    # Permissions Matrix v2: the administrator may act on any item, but the check-out lock still applies.
+    assert api.version(doc, "shared.txt", b"v2 by admin").status_code == 400
+    assert api.patch(f"/documents/{doc}", {"name": "renamed.txt"}).status_code == 400
+    # A Records Manager is not the owner: renaming is owner/Admin only.
     assert records.post(f"/documents/{doc}/release").json["document"]["checked_out_by"] is None
     contributor.post(f"/documents/{doc}/checkout")
     form = {"file": (io.BytesIO(b"v2"), "shared.txt"), "note": "edited"}
@@ -375,11 +375,12 @@ def test_sec02_permissions_at_repository_folder_document_and_version_level(api, 
     assert any(r["name"] == "Reader" for r in found["roles"])
 
 
-def test_sec02_cannot_lock_yourself_out_of_the_repository(app):
+def test_sec02_repository_wide_permissions_are_admin_only(app, admin):
+    # Permissions Matrix v2: system settings and repository-wide access belong to administrators.
     manager = Api(app, make_user("boss", ("Records Manager",)))
     r = manager.post("/permissions/repository/0/grant",
                      json={"principal_type": "user", "principal_id": manager.user.id, "permissions": ["view"]})
-    assert r.status_code == 400
+    assert r.status_code == 403
 
 
 def test_sec03_cookie_login_with_mfa_and_sso_options(app, admin):

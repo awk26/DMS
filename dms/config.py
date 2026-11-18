@@ -262,6 +262,7 @@ class TestConfig(Config):
     SECRET_KEY = "test-secret"
     WTF_CSRF_ENABLED = False
     GMAIL_SYNC_ENABLED = False
+    GMAIL_REVOKE_TOKENS = False  # never call Google when a test unlinks a mailbox
     EMAIL_REMOTE_IMAGES = False  # tests never reach the internet; test_email_images enables it with a fake fetcher
     MAINTENANCE_ENABLED = False
     MALWARE_SCANNER = "builtin"

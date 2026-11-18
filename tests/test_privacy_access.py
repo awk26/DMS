@@ -1,14 +1,17 @@
-"""Privacy and item-level access.
+"""Administrator access and item-level access (DMS Permissions Matrix v2).
 
-* Administrators run the system but get no automatic access to users' private content: other users'
-  My Files (documents, downloads, previews, search, ZIP exports, recycle bin) and archived emails
-  are hidden from them unless explicitly shared.
+* Administrators may act on every folder and document (rule 1.3), and each use of access they would
+  not have as an ordinary user is written to the audit log ("admin override").
+* Archived emails stay private: administrators cannot read another user's email content without a
+  share (section 5).
 * A personal share on a folder/document is the person's exact access there: lowering it (e.g. from
-  Full control to Can view) takes effect even where their role would grant more (Shared library).
+  Edit to View) takes effect even where their role would grant more (Shared library).
+* Only the owner (or an administrator) can share; a non-owner cannot change anybody's access.
 """
 import pytest
 
 from dms.extensions import db
+from dms.models import ActivityLog
 from dms.services.folders import ensure_home
 
 from .conftest import PDF, Api, make_user
@@ -41,70 +44,51 @@ def share(owner, kind, item_id, person, level):
     return r
 
 
-# --------------------------------------------------------------------------- admin privacy
+def overrides(user_id):
+    db.session.rollback()  # overrides are committed in their own transaction
+    return db.session.query(ActivityLog).filter_by(user_id=user_id, action="override").all()
 
-def test_admin_cannot_open_or_download_another_users_private_documents(api, alice):
+
+# --------------------------------------------------------------------------- administrator access
+
+def test_admin_can_open_and_download_another_users_private_documents_and_it_is_audited(api, alice):
     alice_home = home(alice)
     doc = alice.doc("salary.pdf", PDF, folder_id=alice_home)
-    assert api.get(f"/documents/{doc}").status_code in (403, 404)
-    assert api.get(f"/documents/{doc}/content").status_code in (403, 404)
-    assert api.get(f"/documents/{doc}/preview").status_code in (403, 404)
-    assert api.get(f"/folders/{alice_home}").status_code in (403, 404)
-    names = [d["name"] for d in api.get("/documents", query_string={"limit": 1000}).json["documents"]]
-    assert "salary.pdf" not in names
-    assert api.get("/folders/root").json["folders"] == [] or all(
-        f["id"] != alice_home for f in api.get("/folders").json["folders"])
-    # Nor can the admin grant themselves access to it.
-    r = api.post(f"/permissions/document/{doc}/share",
-                 json={"principal_type": "user", "principal_id": api.user.id, "level": "full"})
-    assert r.status_code in (403, 404)
-
-
-def test_admin_sees_private_documents_only_when_shared_and_only_at_that_level(api, alice):
-    doc = alice.doc("plan.pdf", PDF, folder_id=home(alice))
-    share(alice, "document", doc, api, "view")
     assert api.get(f"/documents/{doc}").status_code == 200
-    assert api.get(f"/documents/{doc}/content").status_code == 403
-
-
-def test_admin_recycle_bin_does_not_list_other_users_private_items(api, alice):
-    doc = alice.doc("old.pdf", PDF, folder_id=home(alice))
-    assert alice.delete(f"/documents/{doc}").status_code == 200
-    bin_ = api.get("/recycle-bin").json
-    assert all(d["id"] != doc for d in bin_.get("documents", []))
-
-
-def test_admin_cannot_see_users_content_in_the_shared_library(api, alice, bob):
-    folder = alice.folder("Team space")
-    doc = alice.doc("team.pdf", PDF, folder_id=folder)
-    # Other Contributors share it through their role; the administrator does not.
-    assert bob.get(f"/documents/{doc}").status_code == 200
-    for path in ("", "/content", "/preview"):
-        assert api.get(f"/documents/{doc}{path}").status_code in (403, 404)
-    assert api.get(f"/folders/{folder}").status_code in (403, 404)
-    assert api.patch(f"/documents/{doc}", json={"name": "x.pdf"}).status_code in (403, 404)
-    assert api.delete(f"/documents/{doc}").status_code in (403, 404)
-    assert all(f["id"] != folder for f in api.get("/folders").json["folders"])
-    names = [d["name"] for d in api.get("/documents", query_string={"limit": 1000}).json["documents"]]
-    assert "team.pdf" not in names
-    r = api.post(f"/permissions/document/{doc}/share",
-                 json={"principal_type": "user", "principal_id": api.user.id, "level": "full"})
-    assert r.status_code in (403, 404)
-
-
-def test_admin_sees_shared_library_content_only_when_shared(api, alice):
-    folder = alice.folder("Team space")
-    doc = alice.doc("team.pdf", PDF, folder_id=folder)
-    share(alice, "folder", folder, api, "download")
     assert api.get(f"/documents/{doc}/content").status_code == 200
-    assert api.patch(f"/documents/{doc}", json={"name": "x.pdf"}).status_code == 403
+    assert api.get(f"/folders/{alice_home}").status_code == 200
+    names = [d["name"] for d in api.get("/documents", query_string={"limit": 1000}).json["documents"]]
+    assert "salary.pdf" in names
+    rows = overrides(api.user.id)
+    assert {r.details["permission"] for r in rows} >= {"item.view", "item.download"}
+    assert all(r.status == "success" and r.category == "admin" for r in rows)
+    assert any(r.details.get("owner") == "alice" for r in rows)
 
 
-def test_admin_keeps_running_the_repository_and_own_folders(api):
-    folder = api.folder("Admin area")          # top-level folder created by the administrator
+def test_admin_using_own_access_is_not_an_override(api):
+    folder = api.folder("Admin area")
     doc = api.doc("own.pdf", PDF, folder_id=folder)
     assert api.get(f"/documents/{doc}/content").status_code == 200
     assert api.patch(f"/documents/{doc}", json={"tags": "x"}).status_code == 200
+    assert overrides(api.user.id) == []
+
+
+def test_admin_can_rename_and_delete_users_content_and_change_any_share(api, alice, bob):
+    folder = alice.folder("Team space")
+    doc = alice.doc("team.pdf", PDF, folder_id=folder)
+    assert api.patch(f"/documents/{doc}", json={"name": "renamed.pdf"}).status_code == 200
+    share(api, "document", doc, bob, "view")                     # Admin may change any item's shares
+    assert bob.get(f"/documents/{doc}").status_code == 200
+    assert api.delete(f"/documents/{doc}").status_code == 200
+    assert any(r.details["permission"] == "item.delete" for r in overrides(api.user.id))
+
+
+def test_admin_recycle_bin_lists_every_users_deleted_items(api, alice):
+    doc = alice.doc("old.pdf", PDF, folder_id=home(alice))
+    assert alice.delete(f"/documents/{doc}").status_code == 200
+    bin_ = api.get("/recycle-bin").json
+    row = next(d for d in bin_["documents"] if d["id"] == doc)
+    assert row["can_purge"] is True and bin_["can_purge"] is True
 
 
 def test_admin_cannot_open_another_users_archived_email(app, api, alice):
@@ -123,15 +107,16 @@ def test_admin_cannot_open_another_users_archived_email(app, api, alice):
 
 # --------------------------------------------------------------------------- item-level access
 
-def test_lowering_full_control_to_view_takes_effect_in_the_shared_library(alice, bob):
+def test_lowering_edit_to_view_takes_effect_in_the_shared_library(alice, bob):
     folder = alice.folder("Projects")          # Shared library: Contributors inherit edit here
     doc = alice.doc("spec.pdf", PDF, folder_id=folder)
-    share(alice, "document", doc, bob, "full")
+    share(alice, "document", doc, bob, "edit")
     assert bob.patch(f"/documents/{doc}", json={"tags": "x"}).status_code == 200
 
     share(alice, "document", doc, bob, "view")
     assert bob.get(f"/documents/{doc}").status_code == 200
     assert "edit" not in bob.get(f"/documents/{doc}").json["document"]["permissions"]
+    assert bob.patch(f"/documents/{doc}", json={"tags": "y"}).status_code == 403
     assert bob.patch(f"/documents/{doc}", json={"name": "hacked.pdf"}).status_code == 403
     assert bob.get(f"/documents/{doc}/content").status_code == 403
     assert bob.delete(f"/documents/{doc}").status_code == 403
@@ -167,13 +152,12 @@ def test_document_level_share_overrides_folder_share(alice, bob):
     assert bob.get(f"/documents/{secret}/content").status_code == 403
 
 
-def test_someone_who_can_only_share_cannot_lower_anothers_access(app, admin, alice, bob):
+def test_a_non_owner_cannot_share_or_change_anothers_access(app, admin, alice, bob):
     carol = Api(app, make_user("carol", ("Contributor",), email="carol@example.com", display_name="Carol"))
-    folder = alice.folder("Open")              # Contributors have edit+share here through their role
+    folder = alice.folder("Open")              # Contributors have edit (+ legacy share) here through their role
     doc = alice.doc("o.pdf", PDF, folder_id=folder)
-    # Carol (share permission, not manage) "shares" view with Bob: Bob keeps his edit access.
     r = carol.post(f"/permissions/document/{doc}/share",
                    json={"principal_type": "user", "principal_id": bob.user.id, "level": "view"})
-    assert r.status_code == 200, r.json
+    assert r.status_code == 403, r.json
     assert bob.get(f"/documents/{doc}/content").status_code == 200
     assert "edit" in bob.get(f"/documents/{doc}").json["document"]["permissions"]

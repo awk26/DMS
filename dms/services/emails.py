@@ -514,3 +514,130 @@ def render_preview_html(record, inline_url, image_url=None):
         ".mail-part+.mail-part{margin-top:12px}</style>"
         f"</head><body>{body_html}</body></html>"
     )
+
+
+# ------------------------------------------------------------------- sharing (Permissions Matrix 5)
+# Archived emails are private to the owner (the user who linked the mailbox) and are shared only through
+# the normal share levels. An email has no versions or folders, so the levels that apply are View
+# (read it in the DMS) and Download (also the .eml file and its attachments). Administrators have no
+# access to email content without a share.
+
+EMAIL_SHARE_LEVELS = {"view": ("Can view", {"view"}), "download": ("Can view & download", {"view", "download"})}
+
+
+def email_owner_id(record):
+    return record.account.user_id if record.account is not None else None
+
+
+def email_perms(user, record):
+    """What ``user`` may do with ``record``: owner = view, download and share; otherwise what an active
+    share to the user (or a role they hold) gives."""
+    from ..models import AccessEntry
+    from ..security.permissions import active_clause
+    if user is None or not user.is_active or record is None:
+        return set()
+    if email_owner_id(record) == user.id:
+        return {"view", "download", "share"}
+    role_ids = [r.id for r in user.roles] or [-1]
+    rows = db.session.execute(select(AccessEntry.permissions).where(
+        AccessEntry.target_type == "email", AccessEntry.target_id == record.id, active_clause(),
+        ((AccessEntry.principal_type == "user") & (AccessEntry.principal_id == user.id))
+        | ((AccessEntry.principal_type == "role") & (AccessEntry.principal_id.in_(role_ids))))).scalars().all()
+    perms = set()
+    for value in rows:
+        perms |= {p for p in (value or "").split(",") if p in ("view", "download")}
+    if perms:
+        perms.add("view")
+    return perms
+
+
+def accessible_email(user, email_id):
+    """(record, perms) for an email the user owns or that was shared with them, else (None, set())."""
+    record = owned_email(user, email_id)
+    if record is not None:
+        return record, {"view", "download", "share"}
+    try:
+        record = db.session.get(ArchivedEmail, int(email_id))
+    except (TypeError, ValueError):
+        return None, set()
+    perms = email_perms(user, record)
+    return (record, perms) if "view" in perms else (None, set())
+
+
+def email_shares(record):
+    from ..models import AccessEntry
+    return db.session.execute(select(AccessEntry).where(
+        AccessEntry.target_type == "email", AccessEntry.target_id == record.id)
+        .order_by(AccessEntry.id)).scalars().all()
+
+
+def share_email(record, principal_type, principal_id, level, actor, expires_at=None):
+    """Owner shares an archived email with an active DMS user (or a group role)."""
+    from ..models import AccessEntry, Role, User
+    from ..validation import ValidationError
+    from .activity import log_activity
+    if level not in EMAIL_SHARE_LEVELS:
+        raise ValidationError("Choose View or Download.")
+    if principal_type == "user":
+        person = db.session.get(User, int(principal_id))
+        if person is None or not person.is_active:
+            raise ValidationError("Emails can be shared only with active DMS users.")
+        if person.id == actor.id:
+            raise ValidationError("You cannot change your own access.")
+        name = person.label
+    elif principal_type == "role":
+        role = db.session.get(Role, int(principal_id))
+        if role is None:
+            raise ValidationError("Group not found.")
+        name = f"role {role.name}"
+    else:
+        raise ValidationError("Choose a user or a group.")
+    perms = ",".join(p for p in ("view", "download") if p in EMAIL_SHARE_LEVELS[level][1])
+    entry = db.session.execute(select(AccessEntry).where(
+        AccessEntry.target_type == "email", AccessEntry.target_id == record.id,
+        AccessEntry.principal_type == principal_type, AccessEntry.principal_id == int(principal_id))
+    ).scalar_one_or_none()
+    if entry is None:
+        entry = AccessEntry(target_type="email", target_id=record.id, principal_type=principal_type,
+                            principal_id=int(principal_id), created_by_id=actor.id)
+        db.session.add(entry)
+    entry.permissions = perms
+    entry.expires_at = expires_at
+    log_activity("security", "shared", f"Email '{record.subject or '(no subject)'}' shared with {name} "
+                 f"({EMAIL_SHARE_LEVELS[level][0]})", record.id, entity_type="email",
+                 entity_name=record.subject or "(no subject)",
+                 details={"principal_type": principal_type, "principal_id": int(principal_id), "level": level})
+    db.session.commit()
+    return entry
+
+
+def unshare_email(record, entry_id):
+    from ..models import AccessEntry
+    from .activity import log_activity
+    from .folders import NotFound
+    entry = db.session.get(AccessEntry, entry_id)
+    if entry is None or entry.target_type != "email" or entry.target_id != record.id:
+        raise NotFound("Share not found.")
+    db.session.delete(entry)
+    log_activity("security", "unshared", f"Email '{record.subject or '(no subject)'}': share removed",
+                 record.id, entity_type="email", entity_name=record.subject or "(no subject)",
+                 details={"principal_type": entry.principal_type, "principal_id": entry.principal_id})
+    db.session.commit()
+
+
+def shared_with(user):
+    """Archived emails other people shared with ``user`` (directly or through a role), newest first."""
+    from ..models import AccessEntry
+    from ..security.permissions import active_clause
+    if user is None or not user.is_active:
+        return []
+    role_ids = [r.id for r in user.roles] or [-1]
+    ids = set(db.session.execute(select(AccessEntry.target_id).where(
+        AccessEntry.target_type == "email", active_clause(),
+        ((AccessEntry.principal_type == "user") & (AccessEntry.principal_id == user.id))
+        | ((AccessEntry.principal_type == "role") & (AccessEntry.principal_id.in_(role_ids))))).scalars())
+    if not ids:
+        return []
+    rows = db.session.execute(select(ArchivedEmail).where(ArchivedEmail.id.in_(ids))
+                              .order_by(ArchivedEmail.imported_at.desc())).scalars().all()
+    return [r for r in rows if email_owner_id(r) != user.id]

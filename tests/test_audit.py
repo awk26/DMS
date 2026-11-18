@@ -101,17 +101,16 @@ def test_sharing_and_permission_changes_record_old_and_new_access(api, auditor, 
     assert inh["details"]["changes"]["inherit_permissions"] == {"old": True, "new": False}
 
 
-def test_audit_log_shows_each_user_only_their_own_activity(api, auditor, bob):
+def test_audit_log_shows_contributors_their_own_activity_and_admin_everything(api, auditor, bob):
     api.folder("Admin folder")
     bob.folder("Bob folder")
-    # Every user can read the log, but only entries for their own actions.
+    # Contributors read only the entries for their own actions.
     mine = events(bob)
     assert mine and all(e["user_id"] == bob.user.id for e in mine)
     assert any(e["entity_name"] == "Bob folder" for e in mine)
     assert not any(e["entity_name"] == "Admin folder" for e in mine)
-    # Administrators and auditors do not see other users' activity either.
-    assert all(e["user_id"] == api.user.id for e in events(api))
-    assert not any(e["entity_name"] == "Bob folder" for e in events(api))
+    # Permissions Matrix v2 (admin.audit): administrators see the whole audit log.
+    assert any(e["entity_name"] == "Bob folder" for e in events(api))
     assert events(auditor) == [] or all(e["user_id"] == auditor.user.id for e in events(auditor))
     # Filtering by another user is ignored.
     assert all(e["user_id"] == bob.user.id for e in events(bob, user_id=api.user.id, user="admin"))

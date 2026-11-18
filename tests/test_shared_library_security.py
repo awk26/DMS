@@ -81,11 +81,12 @@ def test_restored_folder_goes_to_nearest_live_ancestor(alice, bob):
 
 # --------------------------------------------------------------------------- retention
 
-def test_admin_cannot_change_retention_of_a_folder_they_cannot_manage(api, alice):
-    r = api.patch(f"/folders/{home(alice)}/retention", json={"keep_last": "1"})
-    assert r.status_code in (403, 404)
+def test_retention_is_admin_only(api, alice):
+    # Permissions Matrix v2: retention and versioning settings are Admin only (admin.policy) - also for
+    # a contributor's own folder - and the administrator can set them on any folder.
     team = alice.folder("Team")
-    assert api.patch(f"/folders/{team}/retention", json={"keep_last": "1"}).status_code in (403, 404)
+    assert alice.patch(f"/folders/{team}/retention", json={"keep_last": "1"}).status_code == 403
+    assert api.patch(f"/folders/{team}/retention", json={"keep_last": "1"}).json["keep_last"] == 1
 
 
 def test_admin_can_set_retention_on_their_own_folder(api):
@@ -100,8 +101,10 @@ def test_view_only_version_cannot_be_restored_into_a_downloadable_one(alice, bob
     assert alice.version(doc, "plan.txt", b"v3 public").status_code in (200, 201)
     share(alice, "document", doc, bob, "edit")
     share(alice, "version", doc, bob, "view", number=2)
+    # Restoring an older version is owner/Admin only, even with Edit access.
     assert bob.post(f"/documents/{doc}/versions/2/restore", json={}).status_code == 403
-    assert bob.post(f"/documents/{doc}/versions/1/restore", json={}).status_code in (200, 201)
+    assert bob.post(f"/documents/{doc}/versions/1/restore", json={}).status_code == 403
+    assert alice.post(f"/documents/{doc}/versions/1/restore", json={}).status_code in (200, 201)
 
 
 def test_copy_respects_a_restricted_current_version(alice, bob):
@@ -196,9 +199,9 @@ def test_delete_error_does_not_name_hidden_documents(alice, bob):
     folder = bob.folder("Bob team")
     secret = bob.doc("unseen-report.pdf", PDF, folder_id=folder)
     stop_inheritance(bob, "document", secret)
-    share(bob, "folder", folder, alice, "full")
+    share(bob, "folder", folder, alice, "edit")
     r = alice.delete(f"/folders/{folder}")
-    assert r.status_code == 400
+    assert r.status_code == 403           # only the owner (or Admin) deletes
     assert "unseen-report" not in str(r.json)
 
 
@@ -213,14 +216,16 @@ def test_document_detail_lists_only_shortcuts_in_visible_folders(alice, bob):
 
 # --------------------------------------------------------------------------- move and access lists
 
-def test_moving_a_folder_needs_delete_on_everything_inside(alice, bob):
+def test_moving_a_folder_is_owner_only_and_blocked_by_other_peoples_items(alice, bob):
     folder = bob.folder("Bob dept")
     locked = bob.doc("keep.pdf", PDF, folder_id=folder)
-    share(bob, "folder", folder, alice, "full")
-    share(bob, "document", locked, alice, "edit")      # Alice may edit but not delete this one
+    share(bob, "folder", folder, alice, "edit")
     r = alice.patch(f"/folders/{folder}", json={"parent_id": home(alice)})
-    assert r.status_code == 400
+    assert r.status_code == 403
     assert bob.get(f"/documents/{locked}").status_code == 200
+    # Alice's upload inside Bob's folder stays hers, so Bob can no longer move the folder away.
+    assert alice.upload("alice.pdf", PDF, folder_id=folder).status_code == 201
+    assert bob.patch(f"/folders/{folder}", json={"parent_id": home(bob)}).status_code == 403
 
 
 def test_access_list_is_only_shown_to_people_who_can_share_or_manage(app, alice):
