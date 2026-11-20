@@ -223,6 +223,39 @@ class Config:
     EMAIL_IMAGE_MAX_COUNT = max(1, _int("DMS_EMAIL_IMAGE_MAX_COUNT", 60))
     EMAIL_IMAGE_TIMEOUT_SECONDS = max(2, _int("DMS_EMAIL_IMAGE_TIMEOUT_SECONDS", 10))
 
+    # Document Validity Management & Expiry Monitoring (dms/validity). Server side only: none of these
+    # values is ever sent to the browser.
+    VALIDITY_MONITORING_ENABLED = _bool("VALIDITY_MONITORING_ENABLED", True)
+    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()   # empty = AI analysis off (manual entry works)
+    GEMINI_MODEL = _str("GEMINI_MODEL", "gemini-3.8-flash")
+    GEMINI_API_BASE = _str("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta")
+    GEMINI_TIMEOUT_SECONDS = max(10, _int("GEMINI_TIMEOUT_SECONDS", 90))
+    GEMINI_MAX_INLINE_MB = max(1, _int("GEMINI_MAX_INLINE_MB", 18))
+    VALIDITY_CONFIDENCE_THRESHOLD = float(_str("VALIDITY_CONFIDENCE_THRESHOLD", "0.75") or 0.75)
+    VALIDITY_TIMEZONE = _str("VALIDITY_TIMEZONE", "Asia/Kolkata")
+    VALIDITY_SCHEDULER_TIME = _str("VALIDITY_SCHEDULER_TIME", "09:00")
+    VALIDITY_NOTIFICATION_START_DAYS = max(1, _int("VALIDITY_NOTIFICATION_START_DAYS", 30))
+    # In-process worker thread in the web app. In production with several web processes, set false and
+    # run one `flask validity-worker` service instead (several are safe, just unnecessary).
+    VALIDITY_WORKER_ENABLED = _bool("VALIDITY_WORKER_ENABLED", True)
+    VALIDITY_WORKER_INTERVAL_SECONDS = max(5, _int("VALIDITY_WORKER_INTERVAL_SECONDS", 30))
+    VALIDITY_JOB_MAX_ATTEMPTS = max(1, _int("VALIDITY_JOB_MAX_ATTEMPTS", 5))
+    VALIDITY_RETRY_BASE_SECONDS = max(5, _int("VALIDITY_RETRY_BASE_SECONDS", 60))
+    VALIDITY_JOB_LEASE_SECONDS = max(60, _int("VALIDITY_JOB_LEASE_SECONDS", 600))
+    VALIDITY_RUN_LEASE_SECONDS = max(60, _int("VALIDITY_RUN_LEASE_SECONDS", 1800))
+    VALIDITY_EMAIL_DEFAULT_MODE = _str("VALIDITY_EMAIL_DEFAULT_MODE", "milestones")
+    # Absolute frontend URL used for links in emails (falls back to DMS_ANGULAR_FRONTEND_URL).
+    VALIDITY_APP_URL = _str("VALIDITY_APP_URL")
+    # Outgoing email (validity alert digests). Empty SMTP_HOST = in-app notifications only.
+    SMTP_HOST = _str("SMTP_HOST")
+    SMTP_PORT = _int("SMTP_PORT", 587)
+    SMTP_USERNAME = _str("SMTP_USERNAME")
+    SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+    SMTP_FROM = _str("SMTP_FROM")
+    SMTP_STARTTLS = _bool("SMTP_STARTTLS", True)
+    SMTP_SSL = _bool("SMTP_SSL", False)
+    SMTP_TIMEOUT_SECONDS = max(5, _int("SMTP_TIMEOUT_SECONDS", 30))
+
     TESTING = False
 
 
@@ -265,6 +298,9 @@ class TestConfig(Config):
     GMAIL_REVOKE_TOKENS = False  # never call Google when a test unlinks a mailbox
     EMAIL_REMOTE_IMAGES = False  # tests never reach the internet; test_email_images enables it with a fake fetcher
     MAINTENANCE_ENABLED = False
+    VALIDITY_WORKER_ENABLED = False   # tests drive jobs and daily runs explicitly
+    GEMINI_API_KEY = ""               # never call Google from tests (a fake client is injected)
+    SMTP_HOST = ""
     MALWARE_SCANNER = "builtin"
     FORCE_HTTPS = False
     LDAP_URL = ""

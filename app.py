@@ -11,7 +11,7 @@ import ssl
 
 from werkzeug.serving import WSGIRequestHandler
 
-from dms import create_app, ensure_maintenance, ensure_scheduler
+from dms import create_app, ensure_maintenance, ensure_scheduler, ensure_validity_worker
 
 app = create_app()
 
@@ -37,5 +37,6 @@ def tls_context():
 if __name__ == "__main__":
     ensure_scheduler(app)  # start Gmail synchronization immediately, not on first request
     ensure_maintenance(app)
+    ensure_validity_worker(app)  # validity analysis jobs + daily expiry run (VALIDITY_WORKER_ENABLED)
     app.run(host=os.environ.get("DMS_HOST", "127.0.0.1"), port=int(os.environ.get("DMS_PORT", "5000")),
             debug=False, threaded=True, ssl_context=tls_context(), request_handler=RequestHandler)

@@ -43,6 +43,16 @@ group.
 | FR-SEC-04 | TLS 1.2+ in transit; AES-256 at rest; customer-managed keys | `GET /admin/status` reports encryption | `DMS_FORCE_HTTPS` + HSTS, TLS 1.2 minimum in `app.py`; AES-256-GCM envelope encryption (`crypto.py`) |
 | FR-SEC-05 | IP restriction, session timeout, device-based policies | `PUT /admin/settings` (`ip_allowlist`, `session_idle_minutes`, `session_max_hours`, `device_policy`, `blocked_platforms`), `GET/PATCH /admin/devices` | `security/auth.py` |
 
+### Document validity & expiry monitoring
+
+Folders can opt in to **Document Validity Monitoring**. Uploaded documents are analysed by Google Gemini (server
+side) for issue and expiry dates; a user with edit access confirms or corrects them, and a daily run sends in-app
+notices (and optional email digests) from 30 days before expiry until renewal, with pause/disable controls and
+"expired but accepted by the port" exceptions. Endpoints: `GET/PUT /folders/{id}/validity`,
+`/documents/{id}/validity` (+ `/analyse`, `/monitoring`, `/subscription`, `/history`, `/exceptions`),
+`GET /validity/documents`, `/notifications`. Design, configuration, deployment, UAT and rollback:
+[docs/DOCUMENT_VALIDITY.md](docs/DOCUMENT_VALIDITY.md).
+
 ### Audit log
 
 Every important action is recorded in `activity_log` (`services/activity.py`): uploads, new versions,

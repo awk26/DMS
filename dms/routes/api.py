@@ -589,7 +589,18 @@ def new_folder():
     data = _body()
     parent = get_folder(data.get("parent_id"))
     _need("folder.create_child", parent)
+    # Optional (document validity module): "enabled" | "disabled" | "inherit" (default: follow the parent).
+    validity_mode = None
+    if data.get("validity_monitoring") not in (None, ""):
+        from ..validity.service import parse_mode
+        validity_mode = parse_mode(data.get("validity_monitoring"))  # validated before anything is created
     folder = create_folder(data.get("name", ""), parent, g.user)
+    if validity_mode and validity_mode != "inherit":
+        from ..validity import access as validity_access
+        from ..validity.service import set_folder_mode
+        if validity_access.can("edit", folder):
+            set_folder_mode(folder, validity_mode, g.user)
+            db.session.commit()
     return jsonify(ok=True, folder=_folder_json(folder)), 201
 
 

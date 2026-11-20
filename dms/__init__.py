@@ -68,6 +68,7 @@ def create_app(config_object=None, **overrides):
     init_oauth(app)
 
     from . import models  # noqa: F401 - register tables
+    from .validity import models as validity_models  # noqa: F401 - register the validity module's tables
     with app.app_context():
         db.create_all()
         from .migrate import upgrade
@@ -78,9 +79,18 @@ def create_app(config_object=None, **overrides):
     app.register_blueprint(auth.callback_bp)
     app.register_blueprint(gmail.callback_bp)
     csrf.exempt(api.bp)
+    # Document validity module: its own /api/v1 endpoints (same api_auth + CSRF check as api.bp), and the
+    # hook that queues AI analysis after uploads commit (it can never fail an upload).
+    from .validity import routes as validity_routes
+    from .validity.jobs import install_hooks as install_validity_hooks
+    app.register_blueprint(validity_routes.bp)
+    csrf.exempt(validity_routes.bp)
+    install_validity_hooks()
 
     from .cli import register_cli
     register_cli(app)
+    from .validity.cli import register as register_validity_cli
+    register_validity_cli(app)
 
     from .security import auth as auth_security
     app.before_request(auth_security.enforce_request_security)
@@ -94,6 +104,7 @@ def create_app(config_object=None, **overrides):
     def _start_schedulers_once():
         ensure_scheduler(app)
         ensure_maintenance(app)
+        ensure_validity_worker(app)
 
     return app
 
@@ -124,6 +135,21 @@ def ensure_maintenance(app):
             app.extensions["dms_maintenance"] = sched
             sched.start()
     return sched
+
+
+def ensure_validity_worker(app):
+    """Start the validity worker thread (analysis jobs, daily expiry run, email retries), once per process.
+    Off when VALIDITY_WORKER_ENABLED=false (then run `flask validity-worker` as a separate service)."""
+    if app.config.get("TESTING") or not app.config.get("VALIDITY_WORKER_ENABLED")             or not app.config.get("VALIDITY_MONITORING_ENABLED"):
+        return None
+    with _scheduler_lock:
+        worker = app.extensions.get("validity_worker")
+        if worker is None:
+            from .validity.scheduler import ValidityWorker
+            worker = ValidityWorker(app)
+            app.extensions["validity_worker"] = worker
+            worker.start()
+    return worker
 
 
 _ERROR_CODES = {
