@@ -46,18 +46,12 @@ from ..models import (
 )
 from ..security import ldap_auth, mfa
 from ..security.auth import (
-    AuthError,
     _load_session_user,
     check_password_policy,
     device_problem,
-    find_user,
     hash_password,
-    login_user,
     logout_user,
-    provision_external,
-    register_failure,
     user_for_token,
-    verify_local,
 )
 from ..security import policy
 from ..security.permissions import CONTENT_PERMS, SYSTEM_CAPS, parse_perms, resolver, reset_resolver
@@ -217,58 +211,6 @@ def csrf_token():
     return jsonify(csrf_token=token)
 
 
-@bp.post("/auth/login")
-def login():
-    failure = _check_csrf()
-    if failure is not None:
-        return failure
-    data = _body()
-    username = (data.get("username") or "").strip()
-    password = data.get("password") or ""
-    try:
-        user = verify_local(username, password)
-        method = "password"
-        if user is None and ldap_auth.enabled():
-            existing = find_user(username)
-            if existing is not None and existing.locked_until and existing.locked_until > utcnow():
-                raise AuthError("This account is temporarily locked after repeated failed sign-ins.")
-            if existing is None or existing.auth_source == "ldap":
-                info = ldap_auth.authenticate(username, password)
-                if info is None and existing is not None:
-                    register_failure(existing)
-                if info is not None:
-                    user = provision_external("ldap", info["dn"], info["email"], info["name"], info["groups"])
-                    db.session.flush()
-                    method = "ldap"
-        if user is None:
-            log_activity("security", "login_failed", f"Failed sign-in for '{username[:100]}'", status="failed")
-            db.session.commit()
-            return jsonify(ok=False, error="The user name or password is incorrect.",
-                           code="invalid_credentials"), 401
-        if not user.is_active:
-            return jsonify(ok=False, error="Your account is disabled.", code="account_disabled"), 403
-        device = login_user(user, method)
-    except (AuthError, ldap_auth.LdapUnavailable) as exc:
-        db.session.rollback()
-        return jsonify(ok=False, error=str(exc), code="authentication_failed"), 401
-
-    problem = device_problem(user, device)
-    if problem:
-        session.clear()
-        db.session.commit()
-        return jsonify(ok=False, error="This device is not permitted.", code=problem), 403
-    token = _new_csrf_token()
-    if not session.get("mfa_ok"):
-        return jsonify(ok=True, mfa_required=True, csrf_token=token), 202
-    from ..services import settings
-    if settings.get("mfa_required") and user.auth_source in ("local", "ldap") and not user.mfa_enabled:
-        return jsonify(ok=True, mfa_setup_required=True, csrf_token=token), 202
-    return jsonify(ok=True, user={"id": user.id, "username": user.username,
-                                  "display_name": user.display_name, "email": user.email,
-                                  "roles": [role.name for role in user.roles]},
-                   csrf_token=token)
-
-
 @bp.post("/auth/mfa")
 def mfa_challenge():
     failure = _check_csrf()
@@ -346,7 +288,7 @@ def mfa_setup_enable():
 
 @bp.get("/auth/options")
 def auth_options():
-    from ..routes.auth import sso_options
+    from .auth import sso_options
     from ..services import settings
     return jsonify(
         setup_required=db.session.execute(select(func.count(User.id))).scalar() == 0,
@@ -381,51 +323,6 @@ def initial_setup():
     log_activity("admin", "setup", f"Initial administrator '{username}' created", user_id)
     db.session.commit()
     return jsonify(ok=True, user={"id": user_id, "username": username}), 201
-
-
-@bp.post("/auth/register")
-def register():
-    failure = _check_csrf()
-    if failure is not None:
-        return failure
-    from ..services import settings
-    if not settings.get("self_signup"):
-        return jsonify(ok=False, error="Self-registration is disabled.", code="registration_disabled"), 403
-    data = _body()
-    username = (data.get("username") or "").strip().lower()
-    email = (data.get("email") or "").strip().lower()
-    display_name = (data.get("display_name") or "").strip()[:200]
-    password = data.get("password") or ""
-    if not display_name:
-        raise ValidationError("Enter your full name.")
-    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email) or len(email) > 320:
-        raise ValidationError("Enter a valid email address.")
-    if not re.match(r"^[a-z0-9][a-z0-9._-]{2,59}$", username):
-        raise ValidationError("User names must be 3–60 characters and use lower-case letters, digits, dots, hyphens or underscores.")
-    if password != (data.get("password2") or ""):
-        raise ValidationError("The passwords do not match.")
-    check_password_policy(password)
-    # Restricted by default: a self-registered account gets no role. It has its own My Files and what
-    # others share with it; an administrator adds it to roles (departments) for Shared library access.
-    # sp_user_create also rejects a user name or email that is already taken.
-    user_id = sp.call_one("sp_user_create", username, email, display_name, hash_password(password), "local",
-                          None)["user_id"]
-    log_activity("security", "signup", f"'{username}' created an account", user_id)
-    db.session.commit()
-    user = db.session.get(User, user_id)
-    device = login_user(user, "password")
-    problem = device_problem(user, device)
-    if problem:
-        session.clear()
-        return jsonify(ok=False, error="This device is not permitted.", code=problem), 403
-    csrf = _new_csrf_token()
-    from ..services import settings
-    return jsonify(ok=True, user={"id": user.id, "username": user.username,
-                                  "display_name": user.display_name, "email": user.email,
-                                  "roles": [item.name for item in user.roles]},
-                   csrf_token=csrf, mfa_required=not session.get("mfa_ok"),
-                   mfa_setup_required=bool(settings.get("mfa_required") and user.auth_source in ("local", "ldap")
-                                           and not user.mfa_enabled)), 201
 
 
 def _need(action, obj, message=None):
@@ -2629,7 +2526,7 @@ def reindex_api():
 @api_auth
 def admin_status():
     _admin_user()
-    from ..security import ldap_auth, saml
+    from ..security import ldap_auth
     from ..security.malware import engine_name
     storage = current_app.extensions["dms_storage"]
     return jsonify(
@@ -2641,7 +2538,6 @@ def admin_status():
                     "key_id": storage.ring.active_key_id if storage.ring else None},
         malware_scanner=engine_name(),
         ldap_enabled=ldap_auth.enabled(),
-        saml_enabled=saml.enabled(),
         https_required=current_app.config.get("FORCE_HTTPS"),
         secure_cookie=current_app.config.get("SESSION_COOKIE_SECURE"),
     )

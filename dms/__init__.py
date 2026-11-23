@@ -64,9 +64,6 @@ def create_app(config_object=None, **overrides):
     db.init_app(app)
     csrf.init_app(app)
 
-    from .routes.auth import init_oauth
-    init_oauth(app)
-
     from . import models  # noqa: F401 - register tables
     from .validity import models as validity_models  # noqa: F401 - register the validity module's tables
     with app.app_context():
@@ -76,7 +73,7 @@ def create_app(config_object=None, **overrides):
 
     from .routes import api, auth, gmail
     app.register_blueprint(api.bp)
-    app.register_blueprint(auth.callback_bp)
+    app.register_blueprint(auth.bp)
     app.register_blueprint(gmail.callback_bp)
     csrf.exempt(api.bp)
     # Document validity module: its own /api/v1 endpoints (same api_auth + CSRF check as api.bp), and the

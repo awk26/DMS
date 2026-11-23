@@ -30,11 +30,9 @@ from .permissions import PREDEFINED_ROLES, reset_resolver
 log = logging.getLogger(__name__)
 
 DEVICE_COOKIE = "dms_device"
-# Non-API endpoints: identity-provider and Gmail OAuth redirects. Everything else is under /api/v1,
+# Non-API endpoints: the SAML single sign-on routes and the Gmail OAuth redirect. Everything else is under /api/v1,
 # which authenticates itself (routes/api.py api_auth).
-PUBLIC_ENDPOINTS = {"auth_callbacks.oidc_login", "auth_callbacks.oidc_callback", "auth_callbacks.saml_login",
-                    "auth_callbacks.saml_acs", "auth_callbacks.saml_complete", "auth_callbacks.saml_metadata",
-                    "gmail_callback.callback"}
+PUBLIC_ENDPOINTS = {"sso.login", "sso.acs", "sso.logout", "sso.sls", "sso.metadata", "gmail_callback.callback"}
 _DUMMY_HASH = generate_password_hash("not-a-real-password")
 
 

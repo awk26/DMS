@@ -183,19 +183,18 @@ class Config:
     LDAP_ATTR_GROUPS = _str("LDAP_ATTR_GROUPS", "memberOf")
     LDAP_LABEL = _str("LDAP_LABEL", "Active Directory")
 
-    # OpenID Connect providers (Azure AD / Entra ID, Google, any OIDC IdP); see oidc_provider_configs()
-    OIDC_PROVIDERS = [p.strip().lower() for p in _str("OIDC_PROVIDERS").split(",") if p.strip()]
-
-    # SAML 2.0
+    # SAML 2.0 single sign-on (ADFS). settings.json holds the SP/IdP endpoints; the SP key is read from
+    # the PFX (file + password) when both are set, otherwise from certs/sp.crt and certs/sp.key.
     SAML_ENABLED = _bool("SAML_ENABLED", False)
-    SAML_IDP_ENTITY_ID = _str("SAML_IDP_ENTITY_ID")
-    SAML_IDP_SSO_URL = _str("SAML_IDP_SSO_URL")
-    SAML_IDP_CERT_FILE = _path("SAML_IDP_CERT_FILE", None)
-    SAML_SP_ENTITY_ID = _str("SAML_SP_ENTITY_ID")    # default: <base url>/auth/saml/metadata
+    SAML_STRICT = _bool("SAML_STRICT", True)
+    SAML_CONFIG_DIR = _path("SAML_CONFIG_DIR", BASE_DIR / "saml_config")
+    SAML_PFX_FILE = _path("SAML_PFX_FILE", BASE_DIR / "saml_config" / "certs" / "JMBCG.pfx")
+    SAML_PFX_PASSWORD = os.environ.get("SAML_PFX_PASSWORD", "")
+    SAML_ATTR_ID = _str("SAML_ATTR_ID", "fedration_ID")
     SAML_ATTR_EMAIL = _str("SAML_ATTR_EMAIL", "email")
-    SAML_ATTR_NAME = _str("SAML_ATTR_NAME", "displayName")
-    SAML_ATTR_GROUPS = _str("SAML_ATTR_GROUPS", "groups")
-    SAML_LABEL = _str("SAML_LABEL", "SAML single sign-on")
+    SAML_ATTR_NAME = _str("SAML_ATTR_NAME", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name")
+    SAML_ATTR_GROUPS = _str("SAML_ATTR_GROUPS", "http://schemas.xmlsoap.org/claims/Group")
+    SAML_LABEL = _str("SAML_LABEL", "Single sign-on")
 
     # Gmail. Every user connects their own mailbox; the OAuth tokens are stored encrypted in
     # gmail_accounts.token_enc, and each user sees only the emails archived from their mailbox.
@@ -259,35 +258,6 @@ class Config:
     TESTING = False
 
 
-def oidc_provider_configs(names=None):
-    """OIDC providers from the environment: OIDC_<NAME>_CLIENT_ID / _CLIENT_SECRET / _METADATA_URL / _LABEL.
-
-    ``entra`` and ``google`` need only a client id/secret (Entra also reads ENTRA_TENANT_ID).
-    """
-    out = {}
-    for name in (Config.OIDC_PROVIDERS if names is None else names):
-        prefix = f"OIDC_{name.upper()}_"
-        metadata = _str(prefix + "METADATA_URL")
-        label = _str(prefix + "LABEL")
-        if name in ("entra", "azure", "azuread") and not metadata:
-            tenant = _str("ENTRA_TENANT_ID", "organizations")
-            metadata = f"https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration"
-            label = label or "Microsoft Entra ID"
-        if name == "google" and not metadata:
-            metadata = "https://accounts.google.com/.well-known/openid-configuration"
-            label = label or "Google"
-        client_id = _str(prefix + "CLIENT_ID")
-        if not (client_id and metadata):
-            continue
-        out[name] = {
-            "client_id": client_id,
-            "client_secret": os.environ.get(prefix + "CLIENT_SECRET", ""),
-            "server_metadata_url": metadata,
-            "label": label or name.title(),
-            "scope": _str(prefix + "SCOPES", "openid email profile"),
-            "groups_claim": _str(prefix + "GROUPS_CLAIM", "groups"),
-        }
-    return out
 
 
 class TestConfig(Config):
@@ -304,5 +274,3 @@ class TestConfig(Config):
     MALWARE_SCANNER = "builtin"
     FORCE_HTTPS = False
     LDAP_URL = ""
-    SAML_ENABLED = False
-    OIDC_PROVIDERS = []

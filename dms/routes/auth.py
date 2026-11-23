@@ -1,62 +1,50 @@
-"""Single sign-on provider endpoints (OpenID Connect and SAML 2.0) and helpers shared with the API.
+"""SAML 2.0 single sign-on against ADFS: login, assertion consumer, logout, single logout and SP metadata.
 
-Password, MFA, sign-up and first-run setup are handled by the JSON API (routes/api.py). These
-endpoints exist because identity providers redirect the browser here; once sign-in finishes, the
-browser is sent back to the React frontend (``ANGULAR_FRONTEND_URL``), which reads
-``?auth_error=...`` / ``?mfa_required=1`` from the query string.
+    GET  /auth/login           start sign-in (redirects to the identity provider)
+    POST /auth/saml/acs        assertion consumer: validates the response, starts the session, redirects to the frontend
+    GET  /auth/logout          end the local session and sign out at the identity provider
+    *    /auth/saml/sls        single logout service (IdP response / IdP-initiated logout)
+    GET  /auth/saml/metadata   service provider metadata
+
+The SAML settings live in saml_config/settings.json (the SP URLs there must match these routes). The SP
+private key comes from the PFX (DMS_SAML_PFX_FILE + DMS_SAML_PFX_PASSWORD) or from certs/sp.crt + sp.key.
 """
-import ipaddress
+import json
 import logging
+import threading
+import time
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from flask import Blueprint, Response, abort, current_app, redirect, request, session, url_for
 
-from ..config import oidc_provider_configs
 from ..extensions import csrf, db
-from ..security import saml
-from ..security.auth import AuthError, device_problem, login_user, provision_external
+from ..security.auth import AuthError, device_problem, login_user, logout_user, provision_external
 from ..services.activity import log_activity
 
 log = logging.getLogger(__name__)
-callback_bp = Blueprint("auth_callbacks", __name__, url_prefix="/auth")
-_oauth = None
+
+bp = Blueprint("sso", __name__, url_prefix="/auth")
+
+_used_assertions = {}  # assertion id -> expiry; rejects a replayed response within this process
+_used_lock = threading.Lock()
 
 
-def init_oauth(app):
-    """Register the configured OpenID Connect providers with Authlib."""
-    global _oauth
-    from authlib.integrations.flask_client import OAuth
-    _oauth = OAuth(app)
-    providers = oidc_provider_configs(app.config.get("OIDC_PROVIDERS") or [])
-    for name, cfg in providers.items():
-        _oauth.register(name=name, client_id=cfg["client_id"], client_secret=cfg["client_secret"],
-                        server_metadata_url=cfg["server_metadata_url"],
-                        client_kwargs={"scope": cfg["scope"], "code_challenge_method": "S256"})
-    app.extensions["dms_oidc"] = providers
+def enabled():
+    cfg = current_app.config
+    return bool(cfg.get("SAML_ENABLED") and (Path(cfg["SAML_CONFIG_DIR"]) / "settings.json").is_file())
 
 
 def sso_options():
-    opts = [{"kind": "oidc", "name": n, "label": c["label"],
-             "login_url": url_for("auth_callbacks.oidc_login", name=n)}
-            for n, c in current_app.extensions.get("dms_oidc", {}).items()]
-    if saml.enabled():
-        opts.append({"kind": "saml", "name": "saml", "label": current_app.config["SAML_LABEL"],
-                     "login_url": url_for("auth_callbacks.saml_login")})
-    return opts
-
-
-def _setup_allowed():
-    """First-run setup is only allowed from the server itself unless explicitly enabled."""
-    if current_app.config.get("ALLOW_REMOTE_SETUP") or current_app.config.get("TESTING"):
-        return True
-    try:
-        return ipaddress.ip_address(request.remote_addr or "").is_loopback
-    except ValueError:
-        return False
+    """Sign-in options listed by GET /api/v1/auth/options."""
+    if not enabled():
+        return []
+    return [{"kind": "saml", "name": "saml", "label": current_app.config["SAML_LABEL"],
+             "login_url": url_for("sso.login")}]
 
 
 def _frontend_url(**params):
-    """The React frontend URL with ``params`` added to its query string ("/" when not configured)."""
+    """The frontend URL with ``params`` added to its query string ("/" when not configured)."""
     target = current_app.config.get("ANGULAR_FRONTEND_URL") or "/"
     parsed = urlsplit(target)
     query = parse_qsl(parsed.query, keep_blank_values=True)
@@ -64,155 +52,177 @@ def _frontend_url(**params):
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", urlencode(query), ""))
 
 
-def _after_first_factor(user, method, next_url=None):
-    device = login_user(user, method)
+def _failure():
+    return redirect(_frontend_url(auth_error="sso_failed"))
+
+
+def _consume_once(assertion_id, not_on_or_after):
+    """True the first time an assertion id is seen; False if it is replayed."""
+    now = time.time()
+    with _used_lock:
+        for key, expiry in list(_used_assertions.items()):
+            if expiry < now:
+                _used_assertions.pop(key, None)
+        if not assertion_id or assertion_id in _used_assertions:
+            return False
+        _used_assertions[assertion_id] = (not_on_or_after or now + 600) + 60
+    return True
+
+
+def _sp_credentials(cfg):
+    """The SP private key and certificate (PEM), loaded once per process."""
+    cache = current_app.extensions.setdefault("dms_saml_sp", {})
+    if cache:
+        return cache
+    base = Path(cfg["SAML_CONFIG_DIR"])
+    pfx, password = cfg.get("SAML_PFX_FILE"), cfg.get("SAML_PFX_PASSWORD")
+    if pfx and password:
+        from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, pkcs12
+        key, cert, _ = pkcs12.load_key_and_certificates(Path(pfx).read_bytes(), password.encode())
+        cache["privateKey"] = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode()
+        cache["x509cert"] = cert.public_bytes(Encoding.PEM).decode()
+    else:
+        cache["privateKey"] = (base / "certs" / "sp.key").read_text(encoding="utf-8")
+        cache["x509cert"] = (base / "certs" / "sp.crt").read_text(encoding="utf-8")
+    return cache
+
+
+def _auth():
+    from onelogin.saml2.auth import OneLogin_Saml2_Auth
+    cfg = current_app.config
+    settings = json.loads((Path(cfg["SAML_CONFIG_DIR"]) / "settings.json").read_text(encoding="utf-8"))
+    settings["strict"] = bool(cfg["SAML_STRICT"])
+    settings["debug"] = False
+    settings["sp"].update(_sp_credentials(cfg))
+    secure = request.is_secure  # behind nginx this needs X-Forwarded-Proto and DMS_TRUSTED_PROXIES=1
+    req = {
+        "https": "on" if secure else "off",
+        "http_host": request.host,
+        "server_port": "443" if secure else "80",
+        "script_name": request.path,
+        "get_data": request.args.copy(),
+        "post_data": request.form.copy(),
+    }
+    return OneLogin_Saml2_Auth(req, old_settings=settings)
+
+
+@bp.get("/login")
+def login():
+    """Start single sign-on: redirect the browser to the identity provider."""
+    if not enabled():
+        abort(404)
+    try:
+        return redirect(_auth().login())
+    except Exception:
+        log.exception("Could not start SAML sign-in")
+        return _failure()
+
+
+@bp.post("/saml/acs")
+@csrf.exempt
+def acs():
+    """Assertion consumer service: the identity provider posts the SAML response here."""
+    if not enabled():
+        abort(404)
+    cfg = current_app.config
+    try:
+        auth = _auth()
+        auth.process_response()
+        errors = auth.get_errors()
+        if errors or not auth.is_authenticated():
+            log.warning("SAML response rejected: %s (%s)", errors, auth.get_last_error_reason())
+            log_activity("security", "login_failed", "SAML sign-in rejected", status="failed")
+            db.session.commit()
+            return _failure()
+        if not _consume_once(auth.get_last_assertion_id(), auth.get_last_assertion_not_on_or_after()):
+            log.warning("SAML assertion replayed or without an id")
+            return _failure()
+
+        attrs = auth.get_attributes()
+
+        def first(name):
+            values = attrs.get(name) or []
+            return str(values[0]).strip() if values else ""
+
+        name_id = (auth.get_nameid() or "").strip()
+        external_id = first(cfg["SAML_ATTR_ID"]) or name_id
+        if not external_id:
+            log.warning("SAML response carried no federation id or NameID")
+            return _failure()
+        email = name_id if "@" in name_id else first(cfg["SAML_ATTR_EMAIL"])
+        name = first(cfg["SAML_ATTR_NAME"]).split(" - ")[0].strip()  # ADFS sends "Full Name - Department"
+        groups = [str(g) for g in (attrs.get(cfg["SAML_ATTR_GROUPS"]) or [])]
+
+        user = provision_external("saml", external_id, email, name, groups)
+        db.session.flush()
+        device = login_user(user, "sso:saml")
+        # Kept for the single logout request (login_user starts a fresh session, so set these after it).
+        session["saml_name_id"] = name_id
+        session["saml_name_id_format"] = auth.get_nameid_format()
+        session["saml_session_index"] = auth.get_session_index()
+    except AuthError as exc:
+        db.session.rollback()
+        log.warning("SAML sign-in refused: %s", exc)
+        return _failure()
+    except Exception:
+        db.session.rollback()
+        log.exception("SAML sign-in failed")
+        return _failure()
+
     problem = device_problem(user, device)
     if problem:
         session.clear()
         db.session.commit()
         return redirect(_frontend_url(auth_error=problem))
-    nxt = next_url or _frontend_url()
     if not session.get("mfa_ok"):
-        session["mfa_next"] = nxt
         return redirect(_frontend_url(mfa_required="1"))
-    return redirect(nxt)
+    return redirect(_frontend_url())
 
 
-def _sso_failure():
-    return redirect(_frontend_url(auth_error="sso_failed"))
+@bp.get("/logout")
+def logout():
+    """End the local session, then sign out at the identity provider (single logout)."""
+    name_id = session.get("saml_name_id")
+    name_id_format = session.get("saml_name_id_format")
+    session_index = session.get("saml_session_index")
+    logout_user()
+    if enabled() and name_id:
+        try:
+            return redirect(_auth().logout(name_id=name_id, session_index=session_index,
+                                           name_id_format=name_id_format))
+        except Exception:
+            log.exception("Could not build the SAML logout request")
+    return redirect(_frontend_url())
 
 
-# --------------------------------------------------------------------------- OpenID Connect
-
-@callback_bp.get("/oidc/<name>")
-def oidc_login(name):
-    if _oauth is None or name not in current_app.extensions.get("dms_oidc", {}):
-        abort(404)
-    session["sso_next"] = _frontend_url()
-    client = _oauth.create_client(name)
-    return client.authorize_redirect(url_for("auth_callbacks.oidc_callback", name=name, _external=True))
-
-
-@callback_bp.get("/oidc/<name>/callback")
-def oidc_callback(name):
-    providers = current_app.extensions.get("dms_oidc", {})
-    if _oauth is None or name not in providers:
-        abort(404)
-    nxt = session.get("sso_next")
-    try:
-        token = _oauth.create_client(name).authorize_access_token()
-    except Exception as exc:
-        log.warning("OIDC callback failed for %s: %s", name, exc)
-        return _sso_failure()
-    claims = token.get("userinfo") or {}
-    subject = claims.get("sub")
-    email = claims.get("email") or claims.get("preferred_username") or claims.get("upn") or ""
-    if name == "google" and claims.get("email") and not claims.get("email_verified", False):
-        email = ""
-    if not subject:
-        log.warning("OIDC provider %s returned no subject", name)
-        return _sso_failure()
-    groups = claims.get(providers[name]["groups_claim"]) or []
-    if isinstance(groups, str):
-        groups = [groups]
-    try:
-        user = provision_external("oidc", f"{name}:{claims.get('iss', '')}:{subject}", email,
-                                  claims.get("name") or "", groups)
-        db.session.flush()
-    except AuthError as exc:
-        db.session.rollback()
-        log.warning("OIDC sign-in via %s refused: %s", name, exc)
-        return _sso_failure()
-    resp = _after_first_factor(user, f"sso:{name}", next_url=nxt)
-    if nxt and session.get("mfa_ok"):
-        return redirect(nxt)
-    return resp
-
-
-# --------------------------------------------------------------------------- SAML 2.0
-
-def _saml_serializer(purpose):
-    from itsdangerous import URLSafeTimedSerializer
-    return URLSafeTimedSerializer(current_app.config["SECRET_KEY"], salt=f"dms-saml-{purpose}")
-
-
-_used_saml_tokens = {}  # token -> expiry; best-effort single use within this process
-
-
-def _consume_once(token, ttl):
-    import time
-    now = time.time()
-    for t, exp in list(_used_saml_tokens.items()):
-        if exp < now:
-            _used_saml_tokens.pop(t, None)
-    if token in _used_saml_tokens:
-        return False
-    _used_saml_tokens[token] = now + ttl
-    return True
-
-
-@callback_bp.get("/saml/login")
-def saml_login():
-    if not saml.enabled():
-        abort(404)
-    # The IdP posts back cross-site, where the (SameSite=Lax) session cookie is not sent, so the
-    # request id and target page travel in a signed RelayState instead of the session.
-    request_id = saml.new_request_id()
-    relay = _saml_serializer("relay").dumps({"rid": request_id, "next": _frontend_url()})
-    url, _ = saml.build_login_redirect(relay, request_id=request_id)
-    return redirect(url)
-
-
-@callback_bp.post("/saml/acs")
+@bp.route("/saml/sls", methods=["GET", "POST"])
 @csrf.exempt
-def saml_acs():
-    """Assertion consumer: validates the response, then finishes sign-in on a same-site GET."""
-    if not saml.enabled():
+def sls():
+    """Single logout service: the identity provider's logout response, or its own logout request."""
+    if not enabled():
         abort(404)
-    from itsdangerous import BadSignature
-    relay_raw = request.form.get("RelayState", "")
+    url = None
     try:
-        relay = _saml_serializer("relay").loads(relay_raw, max_age=600)
-    except BadSignature:
-        relay = {}
-    try:
-        if not relay.get("rid") or not _consume_once(relay_raw, 600):
-            raise saml.SamlError("This sign-in was not started here or has already been used. Try again.")
-        info = saml.parse_response(request.form.get("SAMLResponse"), relay["rid"])
-    except saml.SamlError as exc:
-        log_activity("security", "login_failed", f"SAML sign-in rejected: {exc}", status="failed")
-        db.session.commit()
-        return _sso_failure()
-    token = _saml_serializer("complete").dumps({**info, "next": relay.get("next")})
-    return redirect(url_for("auth_callbacks.saml_complete", t=token))
+        auth = _auth()
+        url = auth.process_slo(delete_session_cb=logout_user)
+        if auth.get_errors():
+            log.warning("SAML logout errors: %s (%s)", auth.get_errors(), auth.get_last_error_reason())
+            url = None
+    except Exception:
+        log.exception("SAML single logout failed")
+    logout_user()
+    return redirect(url or _frontend_url())
 
 
-@callback_bp.get("/saml/complete")
-def saml_complete():
-    from itsdangerous import BadSignature
-    token = request.args.get("t", "")
-    try:
-        info = _saml_serializer("complete").loads(token, max_age=120)
-    except BadSignature:
-        info = None
-    if not info or not _consume_once(token, 120):
-        return _sso_failure()
-    try:
-        user = provision_external("saml", info["name_id"], info["email"], info["name"], info["groups"])
-        db.session.flush()
-    except AuthError as exc:
-        db.session.rollback()
-        log.warning("SAML sign-in refused: %s", exc)
-        return _sso_failure()
-    nxt = info.get("next")
-    resp = _after_first_factor(user, "sso:saml", next_url=nxt)
-    if nxt and session.get("mfa_ok"):
-        return redirect(nxt)
-    return resp
-
-
-@callback_bp.get("/saml/metadata")
-def saml_metadata():
-    if not saml.enabled():
+@bp.get("/saml/metadata", strict_slashes=False)
+def metadata():
+    """Service provider metadata, for registering this application with the identity provider."""
+    if not enabled():
         abort(404)
-    return Response(saml.sp_metadata(), mimetype="application/samlmetadata+xml")
+    settings = _auth().get_settings()
+    meta = settings.get_sp_metadata()
+    errors = settings.validate_metadata(meta)
+    if errors:
+        log.error("Invalid SAML SP metadata: %s", errors)
+        abort(500)
+    return Response(meta, mimetype="text/xml")
