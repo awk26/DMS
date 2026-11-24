@@ -188,7 +188,7 @@ class Config:
     SAML_ENABLED = _bool("SAML_ENABLED", False)
     SAML_STRICT = _bool("SAML_STRICT", True)
     SAML_CONFIG_DIR = _path("SAML_CONFIG_DIR", BASE_DIR / "saml_config")
-    SAML_PFX_FILE = _path("SAML_PFX_FILE", BASE_DIR / "saml_config" / "certs" / "JMBCG.pfx")
+    SAML_PFX_FILE = _path("SAML_PFX_FILE", BASE_DIR / "saml_config" / "certs" / "JMBNEWSSLOCT26.pfx")
     SAML_PFX_PASSWORD = os.environ.get("SAML_PFX_PASSWORD", "")
     SAML_ATTR_ID = _str("SAML_ATTR_ID", "fedration_ID")
     SAML_ATTR_EMAIL = _str("SAML_ATTR_EMAIL", "email")
