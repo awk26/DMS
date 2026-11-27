@@ -504,9 +504,13 @@ class ActivityLog(db.Model):
 
 class GmailAccount(db.Model):
     __tablename__ = "gmail_accounts"
+    # One row per (address, owner). Only one owner may have an address ACTIVE at a time (enforced in
+    # sp_gmail_account_connect); after it is disconnected another user may connect it with a row of their
+    # own, so the previous owner's archived emails (linked by account_id) stay with the previous owner.
+    __table_args__ = (UniqueConstraint("email", "user_id", name="uq_gmail_accounts_email_user"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
     # DMS user who connected the mailbox; only they can see its archived emails.
     user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
     # OAuth token JSON, encrypted with the master key (security.mfa.seal).

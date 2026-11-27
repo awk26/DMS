@@ -114,11 +114,10 @@ def test_1_2_legal_hold_blocks_delete_purge_and_move_even_for_admin(api, alice):
     assert "legal_hold" in alice.get(f"/documents/{doc}").json["document"] and \
         alice.get(f"/documents/{doc}").json["document"]["legal_hold"] is True
 
-    # Released: delete works again, and only Admin may purge.
+    # Released: delete works again, and the owner may then purge it from the recycle bin.
     assert api.put(f"/admin/legal-hold/document/{doc}", json={"hold": False}).status_code == 200
     assert alice.delete(f"/documents/{doc}").status_code == 200
-    assert alice.delete(f"/documents/{doc}/purge").status_code == 403
-    assert api.delete(f"/documents/{doc}/purge").status_code == 200
+    assert alice.delete(f"/documents/{doc}/purge").status_code == 200
     assert {e.action for e in audit(entity_type="document", entity_id=doc)} >= {"legal_hold_set", "legal_hold_released"}
 
 
@@ -147,7 +146,7 @@ def test_1_4_owner_may_do_all_owner_actions(alice):
     assert actions >= {"item.view", "item.download", "item.version.create", "item.metadata.edit",
                        "item.version.restore", "item.rename", "item.move", "item.copy", "item.delete",
                        "item.restore", "item.share"}
-    assert "item.purge" not in actions                                # purge is Admin only
+    assert "item.purge" not in actions                                # purge only from the recycle bin
 
 
 def test_1_6_items_the_user_cannot_see_answer_404_not_403(alice, bob):
@@ -263,16 +262,43 @@ def test_3_restore_older_version_owner_and_admin_only(api, alice, bob):
     assert api.post(f"/documents/{doc}/versions/2/restore", json={}).status_code in (200, 201)
 
 
-def test_3_only_admin_purges_and_empties_the_recycle_bin(api, alice):
+def test_3_owner_purges_and_empties_their_own_recycle_bin_before_the_retention_period(alice, bob):
     doc = alice.doc("trash.pdf", PDF, folder_id=home(alice))
-    assert alice.delete(f"/documents/{doc}").status_code == 200
+    other = alice.doc("other.pdf", PDF + b"other", folder_id=home(alice))
+    bobs = bob.doc("bobs.pdf", PDF + b"bob", folder_id=home(bob))
+    for client, item in ((alice, doc), (alice, other), (bob, bobs)):
+        assert client.delete(f"/documents/{item}").status_code == 200
     bin_ = alice.get("/recycle-bin").json
     row = next(d for d in bin_["documents"] if d["id"] == doc)
-    assert row["can_restore"] is True and row["can_purge"] is False and bin_["can_purge"] is False
-    assert alice.delete(f"/documents/{doc}/purge").status_code == 403
-    assert alice.delete("/recycle-bin").status_code == 403
+    assert row["can_restore"] is True and row["can_purge"] is True and bin_["can_purge"] is True
+
+    # A user cannot purge someone else's item, but purges their own one at any time.
+    assert bob.delete(f"/documents/{doc}/purge").status_code in (403, 404)
+    assert alice.delete(f"/documents/{doc}/purge").status_code == 200
+    assert fresh(Document, doc) is None
+
+    # Emptying the bin removes only the caller's own items.
+    r = alice.delete("/recycle-bin")
+    assert r.status_code == 200 and r.json["purged_documents"] == 1 and r.json["kept_not_allowed"] == 0
+    assert fresh(Document, other) is None
+    assert fresh(Document, bobs) is not None
+    assert alice.get("/recycle-bin").json == {"folders": [], "documents": [], "can_purge": False}
+
+
+def test_3_admin_empties_every_users_recycle_bin(api, alice):
+    doc = alice.doc("trash.pdf", PDF, folder_id=home(alice))
+    assert alice.delete(f"/documents/{doc}").status_code == 200
+    assert api.get("/recycle-bin").json["can_purge"] is True
     assert api.delete("/recycle-bin").json["purged_documents"] == 1
     assert fresh(Document, doc) is None
+
+
+def test_3_live_items_cannot_be_purged_even_by_their_owner(alice):
+    doc = alice.doc("live.pdf", PDF, folder_id=home(alice))
+    folder = alice.folder("Live", home(alice))
+    assert alice.delete(f"/documents/{doc}/purge").status_code == 403
+    assert alice.delete(f"/folders/{folder}/purge").status_code in (403, 404)
+    assert fresh(Document, doc) is not None and fresh(Folder, folder) is not None
 
 
 def test_3_admin_only_system_actions(api, alice, bob):

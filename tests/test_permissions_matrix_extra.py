@@ -6,7 +6,7 @@ Test names start with the PDF section number (1 access model, 2 share levels, 3 
 from datetime import timedelta
 
 from dms.extensions import db
-from dms.models import AccessEntry, ActivityLog, Document, GmailAccount, Role, utcnow
+from dms.models import AccessEntry, ActivityLog, Document, Folder, GmailAccount, Role, utcnow
 from dms.services.emails import store_email
 
 from .conftest import PDF, build_email
@@ -108,10 +108,30 @@ def test_3_contributor_cannot_restore_someone_elses_item_from_the_recycle_bin(al
     assert fresh(Document, doc).deleted_at is not None
 
 
-def test_3_contributors_cannot_purge_even_their_own_items(alice):
+def test_3_contributors_purge_their_own_folders_with_everything_inside(alice):
     folder = alice.folder("Mine to purge", home(alice))
+    sub = alice.folder("Sub", folder)
+    doc = alice.doc("inside.pdf", PDF, folder_id=sub)
     assert alice.delete(f"/folders/{folder}").status_code == 200
+    row = next(f for f in alice.get("/recycle-bin").json["folders"] if f["id"] == folder)
+    assert row["can_purge"] is True
+    assert alice.delete(f"/folders/{folder}/purge").status_code == 200
+    assert fresh(Folder, folder) is None and fresh(Folder, sub) is None and fresh(Document, doc) is None
+
+
+def test_3_a_folder_holding_someone_elses_deleted_item_is_purged_only_by_an_admin(api, alice, bob):
+    folder, _ = setup_shared_folder(alice, bob, "edit")
+    bobs = bob.doc("bobs.pdf", PDF + b"bob", folder_id=folder)
+    assert bob.delete(f"/documents/{bobs}").status_code == 200      # Bob's item, in Bob's recycle bin
+    assert alice.delete(f"/folders/{folder}").status_code == 200
+    row = next(f for f in alice.get("/recycle-bin").json["folders"] if f["id"] == folder)
+    assert row["can_purge"] is False
     assert alice.delete(f"/folders/{folder}/purge").status_code == 403
+    r = alice.delete("/recycle-bin")
+    assert r.status_code == 200 and r.json["purged_folders"] == 0 and r.json["kept_not_allowed"] == 1
+    assert fresh(Folder, folder) is not None and fresh(Document, bobs) is not None
+    assert api.delete(f"/folders/{folder}/purge").status_code == 200
+    assert fresh(Folder, folder) is None and fresh(Document, bobs) is None
 
 
 def test_3_admin_only_role_and_user_management(api, alice, bob):

@@ -60,7 +60,33 @@ CALL sp__ddl_if_missing('index', 'gmail_accounts', 'ix_gmail_accounts_user_id',
   'ALTER TABLE gmail_accounts ADD KEY ix_gmail_accounts_user_id (user_id)')$$
 CALL sp__ddl_if_missing('fk', 'gmail_accounts', 'fk_gmail_accounts_user',
   'ALTER TABLE gmail_accounts ADD CONSTRAINT fk_gmail_accounts_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL')$$
+-- A disconnected address may be connected again by a different user (with a row of their own), so the
+-- address is unique per owner, not globally. Existing rows already satisfy this (email was unique).
+CALL sp__ddl_if_missing('index', 'gmail_accounts', 'uq_gmail_accounts_email_user',
+  'ALTER TABLE gmail_accounts ADD UNIQUE KEY uq_gmail_accounts_email_user (email, user_id)')$$
 DROP PROCEDURE IF EXISTS sp__ddl_if_missing$$
+
+-- Remove the old global UNIQUE(email) key, whatever its name (uq_gmail_accounts_email in older dumps,
+-- `email` when created by SQLAlchemy). Safe to re-run: does nothing once it is gone.
+DROP PROCEDURE IF EXISTS sp__drop_gmail_email_unique$$
+CREATE PROCEDURE sp__drop_gmail_email_unique()
+BEGIN
+  DECLARE v_name VARCHAR(64) DEFAULT NULL;
+  SELECT index_name INTO v_name FROM information_schema.statistics
+   WHERE table_schema = DATABASE() AND table_name = 'gmail_accounts' AND non_unique = 0
+     AND index_name <> 'PRIMARY'
+   GROUP BY index_name
+  HAVING COUNT(*) = 1 AND MAX(column_name) = 'email'
+   LIMIT 1;
+  IF v_name IS NOT NULL THEN
+    SET @ddl = CONCAT('ALTER TABLE gmail_accounts DROP INDEX `', v_name, '`');
+    PREPARE stmt FROM @ddl;
+    EXECUTE stmt;
+    DEALLOCATE PREPARE stmt;
+  END IF;
+END$$
+CALL sp__drop_gmail_email_unique()$$
+DROP PROCEDURE IF EXISTS sp__drop_gmail_email_unique$$
 
 -- A mailbox without an owner (old single-mailbox setup) is neither synced nor shown to anyone
 -- until its owner signs in to the DMS and connects the same Gmail account again.
@@ -708,7 +734,7 @@ CREATE PROCEDURE sp_gmail_account_connect(
 BEGIN
   DECLARE v_email VARCHAR(320) DEFAULT LOWER(TRIM(COALESCE(p_email, '')));
   DECLARE v_id    INT DEFAULT NULL;
-  DECLARE v_owner INT DEFAULT NULL;
+  DECLARE v_busy  INT DEFAULT 0;
   DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
 
   IF p_user_id IS NULL OR v_email = '' OR COALESCE(p_token_enc, '') = '' THEN
@@ -716,9 +742,21 @@ BEGIN
   END IF;
 
   START TRANSACTION;
-  SELECT id, user_id INTO v_id, v_owner FROM gmail_accounts WHERE email = v_email FOR UPDATE;
-  IF v_owner IS NOT NULL AND v_owner <> p_user_id THEN
+  -- Lock every row of this address so two users cannot claim it at the same time.
+  SELECT COUNT(*) INTO v_busy FROM gmail_accounts WHERE email = v_email FOR UPDATE;
+
+  -- Blocked only while ANOTHER user has the address actively connected. Once they disconnect (or an
+  -- administrator disconnects it), anyone may connect it; their emails stay on their own row.
+  IF EXISTS (SELECT 1 FROM gmail_accounts
+              WHERE email = v_email AND is_active = 1 AND user_id IS NOT NULL AND user_id <> p_user_id) THEN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'This Gmail account is already connected by another DMS user.';
+  END IF;
+
+  -- Reuse the caller's own earlier row (sync continues from where it stopped); otherwise take over an
+  -- ownerless legacy row (unchanged behaviour); otherwise a new row is created below (fresh sync).
+  SELECT id INTO v_id FROM gmail_accounts WHERE email = v_email AND user_id = p_user_id LIMIT 1;
+  IF v_id IS NULL THEN
+    SELECT id INTO v_id FROM gmail_accounts WHERE email = v_email AND user_id IS NULL ORDER BY id LIMIT 1;
   END IF;
 
   -- Only one mailbox per user is synced. The previous one is deactivated, but its emails stay with the same user.

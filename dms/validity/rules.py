@@ -1,6 +1,6 @@
 """Pure business rules (no database, no Flask): easy to unit-test and reason about.
 
-* ``notice_for``          which expiry notice (if any) is due on a given business day
+* ``notice_for``          whether an expiry alert milestone is due on a given business day
 * ``exception_applies``   whether an acceptance exception covers a given day
 * ``effective_state``     a document's monitoring state on a given day (pauses end by themselves)
 * ``backoff_seconds``     retry delay for analysis jobs
@@ -11,8 +11,8 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
-# Email milestones (days left). In-app notices are daily regardless.
-EMAIL_MILESTONES = frozenset({30, 15, 7, 3, 1, 0})
+# Alert milestones (days left).
+ALERT_MILESTONES = frozenset({30, 15, 7, 3, 2, 1, 0})
 
 VERIFICATION_STATUSES = ("pending", "requires_confirmation", "needs_review", "verified", "analysis_failed",
                          "unsupported")
@@ -39,33 +39,27 @@ class Notice:
 
     @property
     def email_milestone(self):
-        """Milestone days, the first overdue day and then weekly while overdue."""
-        if self.days_left >= 0:
-            return self.days_left in EMAIL_MILESTONES
-        return (-self.days_left - 1) % 7 == 0
+        """Whether this alert is due on an email milestone."""
+        return self.days_left in ALERT_MILESTONES
 
 
 def days_left(expiry_date, today):
     return (expiry_date - today).days
 
 
-def notice_for(expiry_date, today, start_days=30):
-    """The notice due on ``today`` for a document expiring on ``expiry_date``, or None.
+def notice_for(expiry_date, today):
+    """The alert due on ``today`` for a document expiring on ``expiry_date``, or None.
 
-    Daily from ``start_days`` before expiry (30, 29, ... 1), "expires today" on the day, then daily
-    "expired N days ago" for as long as monitoring applies. Only *today's* notice is ever produced,
-    so a document whose monitoring resumes after a pause never gets a backlog of missed notices.
+    Alerts are sent at 30, 15, 7, 3, 2, 1 and 0 days left. No alerts are sent after expiry.
     """
     if expiry_date is None:
         return None
     left = days_left(expiry_date, today)
-    if left > start_days:
+    if left not in ALERT_MILESTONES:
         return None
-    if left > 0:
-        return Notice("countdown", left, "warning" if left <= 7 else "info")
     if left == 0:
         return Notice("expires_today", 0, "danger")
-    return Notice("expired", left, "danger")
+    return Notice("countdown", left, "warning" if left <= 7 else "info")
 
 
 def validity_status(expiry_date, has_expiry, today, start_days=30):

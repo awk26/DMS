@@ -59,6 +59,7 @@ def ai(app):
     app.extensions["validity_ai_client"] = fake
     yield fake
     app.extensions.pop("validity_ai_client", None)
+    vjobs._prechecked.clear()  # pre-check answers are kept per process; never share them between tests
 
 
 @pytest.fixture
@@ -328,14 +329,14 @@ def test_document_without_expiry_never_notifies(alice, ai):
     assert notes(alice.user.id) == []
 
 
-# =========================================================================== 10-15 notices
+# =========================================================================== expiry milestone alerts
 
-def test_thirty_and_twenty_nine_day_notifications(alice):
+def test_thirty_day_notification_skips_non_milestone_day(alice):
     doc = tracked(alice, T(30))
     daily(T())
     daily(T(1))
     titles = [n.title for n in notes(alice.user.id)]
-    assert titles == ["Vessel Operating License expires in 30 days.", "Vessel Operating License expires in 29 days."]
+    assert titles == ["Vessel Operating License expires in 30 days."]
     first = notes(alice.user.id)[0]
     assert first.link == f"/documents/{doc}#validity" and first.details["vessel_name"] == "MV Example"
     assert first.details["expiry_date"] == T(30).isoformat()
@@ -347,14 +348,13 @@ def test_no_notice_before_the_thirty_day_window(alice):
     assert notes(alice.user.id) == []
 
 
-def test_daily_countdown_expiry_day_and_overdue(alice):
+def test_milestone_countdown_expiry_day_and_stop_after_expiry(alice):
     tracked(alice, T(3))
     for i in range(6):
         daily(T(i))
     assert [n.title.replace("Vessel Operating License ", "") for n in notes(alice.user.id)] == [
-        "expires in 3 days.", "expires in 2 days.", "expires in 1 day.", "expires today.",
-        "expired 1 day ago.", "expired 2 days ago."]
-    assert [n.kind for n in notes(alice.user.id)][3:] == ["expires_today", "expired", "expired"]
+        "expires in 3 days.", "expires in 2 days.", "expires in 1 day.", "expires today."]
+    assert [n.kind for n in notes(alice.user.id)][3:] == ["expires_today"]
 
 
 def test_duplicate_scheduler_execution_creates_no_duplicates(alice):
@@ -443,7 +443,7 @@ def exception(client, doc, **over):
     return client.post(f"/documents/{doc}/validity/exceptions", json=body)
 
 
-def test_expired_but_accepted_suppresses_notices_without_changing_expiry(alice):
+def test_expiry_alerts_stop_after_expiry_even_if_accepted(alice):
     doc = tracked(alice, T(-2))
     assert exception(alice, doc, end_date="", indefinite_justification="").status_code == 400  # unjustified
     r = exception(alice, doc)
@@ -455,13 +455,13 @@ def test_expired_but_accepted_suppresses_notices_without_changing_expiry(alice):
     assert record(doc).expiry_date == T(-2)
 
 
-def test_exception_end_and_withdrawal_resume_notices(alice):
+def test_exception_end_and_withdrawal_do_not_resume_post_expiry_alerts(alice):
     doc = tracked(alice, T(-2))
     exception(alice, doc, end_date=T(1).isoformat())
     daily(T(1))
-    assert notes(alice.user.id) == []                          # last day of the exception
+    assert notes(alice.user.id) == []
     daily(T(2))
-    assert [n.title for n in notes(alice.user.id)] == ["Vessel Operating License expired 4 days ago."]
+    assert notes(alice.user.id) == []
 
     other = tracked(alice, T(-1), name="permit.txt", folder=monitored_folder(alice, "Permits"))
     exc = exception(alice, other, end_date="", indefinite_justification="Accepted by all ports until further notice",
@@ -471,7 +471,7 @@ def test_exception_end_and_withdrawal_resume_notices(alice):
     r = alice.post(f"/documents/{other}/validity/exceptions/{exc['id']}/withdraw", json={"reason": "Port changed rule"})
     assert r.json["exceptions"][0]["status"] == "withdrawn" and r.json["exceptions"][0]["withdrawn_by"] == "Alice"
     daily(T(4))
-    assert any(n.entity_id == other for n in notes(alice.user.id))
+    assert notes(alice.user.id) == []
     assert db.session.query(ValidityException).count() == 2    # history kept
 
 
@@ -632,10 +632,12 @@ def test_email_digest_milestones_and_retry(app, alice):
         from dms.validity.notifications import deliver_pending
         assert deliver_pending(now=utcnow() + timedelta(hours=1)) == 1
         assert sent[0][0] == "alice@example.com" and "expires in 30 days" in sent[0][2]
-        daily(T(1))                                            # 29 days: not a milestone
-        assert notes(alice.user.id)[1].email_status == "none"
+        daily(T(1))                                            # 29 days: no alert
+        assert len(notes(alice.user.id)) == 1
+        daily(T(28))                                           # 2 days: a milestone
+        assert notes(alice.user.id)[1].email_status == "sent"
         alice.put("/notifications/preferences", json={"email_mode": "off"})
-        daily(T(15))                                           # milestone, but email is off
+        daily(T(30))                                           # expiry day, but email is off
         assert notes(alice.user.id)[2].email_status == "none"
     finally:
         app.extensions.pop("validity_mailer", None)
@@ -654,3 +656,69 @@ def test_dashboard_filters(alice):
 def test_operational_status_is_admin_only(api, alice):
     assert api.get("/validity/status").status_code == 200
     assert alice.get("/validity/status").status_code == 403
+
+
+# =========================================================================== expired on upload (warning only)
+
+def test_expired_document_is_saved_and_only_the_uploader_is_warned_in_the_app(alice, ai):
+    ai.responses.append(answer(issue_date=T(-400).isoformat(), expiry_date=T(-1).isoformat()))
+    doc = alice.doc("licence.txt", TEXT, folder_id=monitored_folder(alice))
+    assert process() == 1
+    r = record(doc)
+    assert r.expiry_date == T(-1) and r.verification_status == "requires_confirmation"   # workflow unchanged
+    assert db.session.get(Document, doc).deleted_at is None                               # saved, not rejected
+    warnings = [n for n in notes(alice.user.id) if n.kind == "expired_on_upload"]
+    assert len(warnings) == 1
+    assert warnings[0].severity == "warning" and warnings[0].email_status == "none"       # in the app only
+    assert validity(alice, doc)["record"]["expired_on_upload"] is True
+    assert db.session.query(ActivityLog).filter_by(action="validity_expired_on_upload", entity_id=doc).count() == 1
+
+    # A manual re-analysis of the same version does not warn again.
+    ai.responses.append(answer(issue_date=T(-400).isoformat(), expiry_date=T(-1).isoformat()))
+    assert alice.post(f"/documents/{doc}/validity/analyse").status_code == 202
+    process()
+    assert len([n for n in notes(alice.user.id) if n.kind == "expired_on_upload"]) == 1
+
+
+@pytest.mark.parametrize("days_left", [0, 100])
+def test_document_not_yet_expired_at_upload_gets_no_warning(alice, ai, days_left):
+    ai.responses.append(answer(issue_date=T(-400).isoformat(), expiry_date=T(days_left).isoformat()))
+    doc = alice.doc("licence.txt", TEXT, folder_id=monitored_folder(alice))
+    assert process() == 1
+    assert [n for n in notes(alice.user.id) if n.kind == "expired_on_upload"] == []
+    assert validity(alice, doc)["record"]["expired_on_upload"] is False
+
+
+def check_upload(client, data, name="licence.txt", **target):
+    form = {"file": (io.BytesIO(data), name), **{k: str(v) for k, v in target.items()}}
+    return client.post("/validity/check-upload", data=form, content_type="multipart/form-data")
+
+
+def test_check_before_upload_warns_about_an_expired_file_and_stores_nothing(alice, ai):
+    folder = monitored_folder(alice)
+    ai.responses.append(answer(issue_date=T(-400).isoformat(), expiry_date=T(-1).isoformat()))
+    r = check_upload(alice, TEXT, folder_id=folder)
+    assert r.status_code == 200
+    assert r.json == {"checked": True, "has_expiry": True, "expiry_date": T(-1).isoformat(), "expired": True}
+    assert db.session.query(Document).count() == 0                          # nothing stored
+
+    # Uploading the same file afterwards reuses the answer: no second AI call.
+    doc = alice.doc("licence.txt", TEXT, folder_id=folder)
+    assert process() == 1 and len(ai.calls) == 1
+    assert record(doc).expiry_date == T(-1)
+    assert len([n for n in notes(alice.user.id) if n.kind == "expired_on_upload"]) == 1
+
+
+def test_check_before_upload_of_a_new_version(alice, ai):
+    folder = monitored_folder(alice)
+    doc = alice.doc("licence.txt", TEXT, folder_id=folder)
+    ai.responses.append(answer(expiry_date=T(30).isoformat(), issue_date=T(-300).isoformat()))
+    r = check_upload(alice, TEXT + b"renewed", document_id=doc)
+    assert r.json["checked"] is True and r.json["expired"] is False
+
+
+def test_check_before_upload_is_skipped_outside_monitored_folders_and_needs_upload_access(alice, bob, ai):
+    plain = alice.folder("Plain", home(alice))
+    assert check_upload(alice, TEXT, folder_id=plain).json == {"checked": False}
+    assert ai.calls == []
+    assert check_upload(bob, TEXT, folder_id=monitored_folder(alice)).status_code in (403, 404)

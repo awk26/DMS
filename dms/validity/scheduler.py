@@ -36,7 +36,7 @@ from . import clock
 from .jobs import reconcile, run_due_jobs, worker_id
 from .models import DocumentValidity, ValiditySchedulerRun
 from .notifications import deliver_pending, notify, wants_email
-from .rules import notice_for
+from .rules import ALERT_MILESTONES, notice_for
 
 log = logging.getLogger(__name__)
 MAX_RUN_ATTEMPTS = 5
@@ -78,11 +78,10 @@ def _label(record, doc):
 
 def check_documents(today):
     """The daily check itself (assumes the day is claimed). Returns statistics."""
-    from .service import applicable_exceptions, auto_resume, enabled_folders, recipients, start_days
+    from .service import auto_resume, enabled_folders, recipients
     stats = {"documents_checked": 0, "notifications_created": 0, "resumed": 0, "errors": 0, "suppressed": 0}
-    start = start_days()
 
-    # 3. Pauses whose last day has passed end now (before the notices, so they get today's notice).
+    # 3. Resume pauses whose last day has passed before checking today's alert milestones.
     for record, doc in db.session.execute(
             select(DocumentValidity, Document).join(Document, Document.id == DocumentValidity.document_id)
             .where(DocumentValidity.monitoring_state == "paused", DocumentValidity.paused_until < today)).all():
@@ -95,13 +94,14 @@ def check_documents(today):
         return stats
     ids = db.session.execute(
         select(DocumentValidity.id).join(Document, Document.id == DocumentValidity.document_id).where(
-            Document.deleted_at.is_(None),                         # 4
-            Document.folder_id.in_(list(enabled)),
-            DocumentValidity.monitoring_state == "active",          # 3
-            DocumentValidity.version_id == Document.current_version_id,  # 5
-            DocumentValidity.verification_status == "verified",     # 6
+            Document.deleted_at.is_(None),                         # 3
+            Document.folder_id.in_(list(enabled)),                 # 1
+            DocumentValidity.monitoring_state == "active",         # 2
+            DocumentValidity.version_id == Document.current_version_id,  # 4
+            DocumentValidity.verification_status == "verified",    # 5
             DocumentValidity.has_expiry.is_(True), DocumentValidity.expiry_date.is_not(None),
-            DocumentValidity.expiry_date <= today + timedelta(days=start),  # 8 (upper bound)
+            DocumentValidity.expiry_date >= today,
+            DocumentValidity.expiry_date <= today + timedelta(days=max(ALERT_MILESTONES)),
         ).order_by(DocumentValidity.id)).scalars().all()
 
     resolvers = {}  # one permission resolver per recipient for the whole run
@@ -110,11 +110,8 @@ def check_documents(today):
             record = db.session.get(DocumentValidity, record_id)
             doc = db.session.get(Document, record.document_id)
             stats["documents_checked"] += 1
-            notice = notice_for(record.expiry_date, today, start)    # 8
+            notice = notice_for(record.expiry_date, today)
             if notice is None:
-                continue
-            if notice.days_left < 0 and applicable_exceptions(doc.id, today):  # 7
-                stats["suppressed"] += 1
                 continue
             label = _label(record, doc)
             details = {"document_id": doc.id, "document_name": doc.name, "document_type": record.document_type,

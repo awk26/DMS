@@ -22,39 +22,37 @@ EXPIRY = date(2026, 12, 19)
 # --------------------------------------------------------------------------- countdown
 
 def test_no_notice_before_the_window():
-    assert notice_for(EXPIRY, date(2026, 11, 18), 30) is None   # 31 days left
+    assert notice_for(EXPIRY, date(2026, 11, 18)) is None   # 31 days left
 
 
-def test_thirty_and_twenty_nine_day_notices():
-    first = notice_for(EXPIRY, date(2026, 11, 19), 30)
+def test_thirty_day_notice_and_skip_non_milestone_day():
+    first = notice_for(EXPIRY, date(2026, 11, 19))
     assert (first.kind, first.days_left) == ("countdown", 30)
     assert first.message("Vessel Operating License") == "Vessel Operating License expires in 30 days."
-    second = notice_for(EXPIRY, date(2026, 11, 20), 30)
-    assert second.message("Vessel Operating License") == "Vessel Operating License expires in 29 days."
+    assert notice_for(EXPIRY, date(2026, 11, 20)) is None
 
 
-def test_daily_countdown_has_one_notice_per_day_without_gaps():
-    days = [notice_for(EXPIRY, date(2026, 11, 19) + timedelta(days=i), 30) for i in range(31)]
-    assert [n.days_left for n in days] == list(range(30, -1, -1))
-    assert days[-2].phrase() == "expires in 1 day"
+def test_alerts_are_only_due_on_requested_milestones():
+    days = [notice_for(EXPIRY, date(2026, 11, 19) + timedelta(days=i)) for i in range(31)]
+    assert [n.days_left for n in days if n] == [30, 15, 7, 3, 2, 1, 0]
 
 
-def test_expiry_day_and_overdue_notices():
-    today = notice_for(EXPIRY, EXPIRY, 30)
+def test_expiry_day_alert_and_no_alerts_after_expiry():
+    today = notice_for(EXPIRY, EXPIRY)
     assert (today.kind, today.phrase(), today.severity) == ("expires_today", "expires today", "danger")
-    after = notice_for(EXPIRY, EXPIRY + timedelta(days=1), 30)
-    assert (after.kind, after.message("Licence")) == ("expired", "Licence expired 1 day ago.")
-    assert notice_for(EXPIRY, EXPIRY + timedelta(days=40), 30).phrase() == "expired 40 days ago"
+    assert notice_for(EXPIRY, EXPIRY + timedelta(days=1)) is None
 
 
-def test_configurable_start_days():
-    assert notice_for(EXPIRY, EXPIRY - timedelta(days=10), 7) is None
-    assert notice_for(EXPIRY, EXPIRY - timedelta(days=7), 7).days_left == 7
+def test_non_milestone_days_do_not_alert():
+    assert notice_for(EXPIRY, EXPIRY - timedelta(days=10)) is None
+    assert notice_for(EXPIRY, EXPIRY - timedelta(days=7)).days_left == 7
+    assert notice_for(EXPIRY, EXPIRY - timedelta(days=6)) is None
 
 
 def test_email_milestones():
-    picks = {d for d in range(30, -20, -1) if notice_for(EXPIRY, EXPIRY - timedelta(days=d), 30).email_milestone}
-    assert picks == {30, 15, 7, 3, 1, 0, -1, -8, -15}
+    notices = [notice_for(EXPIRY, EXPIRY - timedelta(days=d)) for d in range(30, -20, -1)]
+    picks = {notice.days_left for notice in notices if notice and notice.email_milestone}
+    assert picks == {30, 15, 7, 3, 2, 1, 0}
 
 
 def test_validity_status():
@@ -224,6 +222,12 @@ def test_business_time_zone_offset():
     assert clock.zone("Asia/Kolkata").utcoffset(moment) == timedelta(hours=5, minutes=30)
     assert clock.zone("UTC+04:00").utcoffset(moment) == timedelta(hours=4)
     assert clock.parse_hhmm("07:45").hour == 7 and clock.parse_hhmm("bad").hour == 9
+
+
+def test_upload_date_is_counted_in_the_business_time_zone():
+    # 20:00 UTC on 18 Nov is already 19 Nov in India (an upload that evening is a 19 Nov upload there).
+    assert clock.local_date(datetime(2026, 11, 18, 20, 0), clock.zone("Asia/Kolkata")) == date(2026, 11, 19)
+    assert clock.local_date(datetime(2026, 11, 18, 20, 0), clock.zone("UTC")) == date(2026, 11, 18)
 
 
 def test_gemini_error_carries_googles_explanation():

@@ -1280,10 +1280,23 @@ def email_render(email_id):
     page's policy, which lets the app's own CSP forbid inline styles (ZAP: CSP style-src unsafe-inline)
     while the email keeps its formatting.
     """
-    from ..models import EmailImage
-    from ..storage import get_storage
     record = _own_email(email_id)
     _fetch_linked_images_once(record)
+    inline_url, image_url = _embedded_image_urls(record)
+    try:
+        html_doc = email_svc.render_preview_html(record, inline_url, image_url=image_url)
+    except FileNotFoundError:
+        raise NotFound("The original message file is missing.")
+    resp = _frameable(Response(html_doc, mimetype="text/html"), EMAIL_RENDER_CSP)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _embedded_image_urls(record):
+    """(inline_url, image_url) callbacks that embed the email's images as data: URLs, so the HTML needs
+    nothing from this origin (used by the preview frame and the .html download)."""
+    from ..models import EmailImage
+    from ..storage import get_storage
     try:
         msg = email_svc.load_message(record)
     except FileNotFoundError:
@@ -1303,13 +1316,7 @@ def email_render(email_id):
         except FileNotFoundError:
             return ""
 
-    try:
-        html_doc = email_svc.render_preview_html(record, inline_url, image_url=image_url)
-    except FileNotFoundError:
-        raise NotFound("The original message file is missing.")
-    resp = _frameable(Response(html_doc, mimetype="text/html"), EMAIL_RENDER_CSP)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+    return inline_url, image_url
 
 
 @bp.get("/emails/<int:email_id>/body")
@@ -1344,6 +1351,33 @@ def email_eml(email_id):
                          download_name=f"{name} [{record.gmail_message_id}] (with images).eml")
     return stream_stored(record.storage_key, "message/rfc822", f"{name} [{record.gmail_message_id}].eml",
                          as_attachment=True, etag=record.sha256)
+
+
+@bp.get("/emails/<int:email_id>/html")
+@api_auth
+def email_html(email_id):
+    """The email as a standalone .html file: as shown in the DMS (headers, body, embedded images), plus a
+    download link for each attached file. The links are absolute, so they work from the saved file, and
+    go to the attachment endpoint, which checks the reader's login and download permission."""
+    record = _email_for(email_id, "download")
+    name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", record.subject or "").strip(" .")[:80] or "message"
+    _fetch_linked_images_once(record)
+    inline_url, image_url = _embedded_image_urls(record)
+    # The configured site address (nginx serves /api/ on the same host). The request's Host header, which
+    # a client controls, is only a fallback for development setups without DMS_ANGULAR_FRONTEND_URL.
+    from urllib.parse import urlsplit
+    site = urlsplit(current_app.config.get("ANGULAR_FRONTEND_URL") or request.host_url)
+    base = f"{site.scheme}://{site.netloc}"
+
+    def attachment_url(part_index):
+        return base + url_for("api.email_attachment", email_id=record.id, part_index=part_index)
+
+    try:
+        html_doc = email_svc.render_download_html(record, inline_url, image_url, attachment_url)
+    except FileNotFoundError:
+        raise NotFound("The original message file is missing.")
+    return send_file(io.BytesIO(html_doc.encode("utf-8")), mimetype="text/html", as_attachment=True, max_age=0,
+                     download_name=f"{name} [{record.gmail_message_id}].html")
 
 
 @bp.get("/emails/<int:email_id>/attachments/<int:part_index>")
@@ -1579,8 +1613,8 @@ def shared_items():
 @bp.get("/recycle-bin")
 @api_auth
 def recycle_bin():
-    """Owners see their own deleted items (restorable within the retention window); administrators see
-    every deleted item and are the only ones who can permanently delete (Permissions Matrix 6)."""
+    """Owners see their own deleted items (restorable within the retention window) and may permanently
+    delete them; administrators see every deleted item (Permissions Matrix 6)."""
     res = resolver()
     folders, documents = recycle_bin_items(g.user, res)
 
@@ -1590,24 +1624,34 @@ def recycle_bin():
                     legal_hold=bool(item.legal_hold))
         return data
 
+    folder_rows = [row(item, _folder_json(item)) for item in folders]
+    document_rows = [row(item, _doc_json(item)) for item in documents]
     return jsonify(
-        folders=[row(item, _folder_json(item)) for item in folders],
-        documents=[row(item, _doc_json(item)) for item in documents],
-        can_purge=res.is_admin,
+        folders=folder_rows,
+        documents=document_rows,
+        # "Empty recycle bin" is offered when at least one listed item can be permanently deleted.
+        can_purge=res.is_admin or any(r["can_purge"] for r in folder_rows + document_rows),
     )
 
 
 @bp.delete("/recycle-bin")
 @api_auth
 def empty_recycle_bin():
-    _need("item.purge", None, "Only an administrator can permanently delete items.")
-    folders, documents = recycle_bin_items(g.user, resolver())
-    purged_folders = purged_documents = held = 0
+    """Permanently delete every item in the caller's recycle bin that they may purge: an administrator
+    everything listed, any other user their own items. Items under legal hold are kept (``kept_on_hold``),
+    and so are items the caller may not purge, e.g. a folder that holds someone else's items
+    (``kept_not_allowed``)."""
+    res = resolver()
+    folders, documents = recycle_bin_items(g.user, res)
+    purged_folders = purged_documents = held = not_allowed = 0
     for folder in folders:
         if db.session.get(Folder, folder.id) is None:
             continue
         if policy.under_hold(folder):
             held += 1
+            continue
+        if not policy.decide(res, "item.purge", folder)[0]:
+            not_allowed += 1
             continue
         purge_folder(folder, reason="recycle bin emptied through the API")
         purged_folders += 1
@@ -1617,10 +1661,14 @@ def empty_recycle_bin():
         if policy.under_hold(document):
             held += 1
             continue
+        if not policy.decide(res, "item.purge", document)[0]:
+            not_allowed += 1
+            continue
         svc.purge_document(document, reason="recycle bin emptied through the API")
         purged_documents += 1
     db.session.commit()
-    return jsonify(ok=True, purged_folders=purged_folders, purged_documents=purged_documents, kept_on_hold=held)
+    return jsonify(ok=True, purged_folders=purged_folders, purged_documents=purged_documents, kept_on_hold=held,
+                   kept_not_allowed=not_allowed)
 
 
 def _owner_json(item):

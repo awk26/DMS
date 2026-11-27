@@ -77,6 +77,7 @@ def _record_json(doc, record, today):
         "document_type": record.document_type, "title": record.title, "document_number": record.document_number,
         "vessel_name": record.vessel_name, "issuing_authority": record.issuing_authority,
         "issue_date": _date(record.issue_date), "expiry_date": _date(record.expiry_date),
+        "expired_on_upload": service.expired_on_upload(record),
         "has_expiry": record.has_expiry, "confidence": record.confidence,
         "verification_status": record.verification_status, "review_reasons": record.review_reasons,
         "source": record.source, "verified_by": _user_label(record.verified_by_id),
@@ -148,6 +149,40 @@ def analyse_validity(doc_id):
     requeue_current(doc, g.user)
     wake_worker()
     return jsonify(ok=True, **_validity_payload(doc)), 202
+
+
+@bp.post("/validity/check-upload")
+@api_auth
+def check_upload():
+    """Before an upload: has the chosen file already expired? Form fields: ``file`` and either ``folder_id``
+    (new document) or ``document_id`` (new version). Nothing is stored. Answers ``{"checked": false}`` when
+    the folder is not monitored, the AI is not configured or the file cannot be analysed; the upload itself
+    never depends on this check."""
+    from ..security import policy
+    from ..validation import validate_upload
+    from .jobs import check_new_file
+    from .rules import parse_iso_date
+    doc_id = request.form.get("document_id", type=int)
+    if doc_id is not None:
+        doc = doc_svc.get_document(doc_id)
+        policy.require("item.version.create", doc)
+        folder = doc.folder
+    else:
+        folder = get_folder(request.form.get("folder_id"))
+        policy.require("folder.upload", folder)
+    if folder is None or not service.module_enabled() or not _ai_configured() \
+            or not service.effective_folder_setting(folder)[0]:
+        return jsonify(checked=False)
+    file = request.files.get("file")
+    display_name, ext, _ = validate_upload(file)
+    doc_svc._scan(file, display_name)  # nothing leaves the server before it passed the malware scan
+    file.stream.seek(0)
+    result = check_new_file(file.stream.read(), ext)
+    if result is None:
+        return jsonify(checked=False)
+    expiry = parse_iso_date(result["expiry_date"] or "")
+    return jsonify(checked=True, has_expiry=result["has_expiry"], expiry_date=_date(expiry),
+                   expired=bool(expiry and expiry < clock.today()))
 
 
 @bp.post("/documents/<int:doc_id>/validity/monitoring")

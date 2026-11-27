@@ -16,11 +16,13 @@ Processing
     JSON) are retried with exponential backoff up to VALIDITY_JOB_MAX_ATTEMPTS; unusable files fail at
     once. The worker never holds a database transaction open while waiting for the AI service.
 """
+import hashlib
 import io
 import logging
 import os
 import socket
 import threading
+import time
 from datetime import timedelta
 
 from flask import current_app, has_app_context
@@ -243,16 +245,21 @@ def claim_next(owner, lease_seconds=None):
 def prepare_input(doc, version):
     """What to send to the AI: ``{"data", "mime_type"}`` for PDFs and images, ``{"text"}`` for other
     formats DMS can read (Office, OpenDocument, text). Raises UnsupportedDocument."""
-    from ..services.text_extract import extract_bytes
     from ..storage import get_storage
-    max_bytes = max(1, int(_cfg("GEMINI_MAX_INLINE_MB", 18))) * 1024 * 1024
     try:
         data = get_storage().read_bytes(version.storage_key)
     except FileNotFoundError:
         raise UnsupportedDocument("The stored file is missing.") from None
+    return payload_for(data, doc.extension)
+
+
+def payload_for(data, extension):
+    """The AI input for file content ``data`` with file extension ``extension``. Raises UnsupportedDocument."""
+    from ..services.text_extract import extract_bytes
+    max_bytes = max(1, int(_cfg("GEMINI_MAX_INLINE_MB", 18))) * 1024 * 1024
     if not data:
         raise UnsupportedDocument("The file is empty.")
-    ext = (doc.extension or "").lower()
+    ext = (extension or "").lower()
     if ext == "pdf":
         if not data.lstrip()[:5] == b"%PDF-":
             raise UnsupportedDocument("The file is not a valid PDF.")
@@ -294,6 +301,50 @@ def prepare_input(doc, version):
     if text.strip():
         return {"text": text[:TEXT_LIMIT]}
     raise UnsupportedDocument(f"Validity analysis does not support .{ext or '?'} files without readable text.")
+
+
+# AI answers from upload pre-checks, by SHA-256 of the file: the analysis job of the same file uploaded
+# shortly afterwards uses the answer instead of calling the AI a second time. Per process, short-lived.
+_PRECHECK_TTL_SECONDS = 30 * 60
+_PRECHECK_MAX = 200
+_prechecked = {}
+_prechecked_lock = threading.Lock()
+
+
+def _remember_precheck(sha, raw):
+    now = time.monotonic()
+    with _prechecked_lock:
+        for key in [k for k, (until, _) in _prechecked.items() if until <= now]:
+            del _prechecked[key]
+        if len(_prechecked) >= _PRECHECK_MAX:
+            del _prechecked[next(iter(_prechecked))]  # oldest entry
+        _prechecked[sha] = (now + _PRECHECK_TTL_SECONDS, raw)
+
+
+def _take_precheck(sha):
+    with _prechecked_lock:
+        until, raw = _prechecked.pop(sha, (0, None))
+    return raw if until > time.monotonic() else None
+
+
+def check_new_file(data, extension):
+    """AI analysis of a file that is about to be uploaded (nothing is stored). Returns the validated
+    result, or None when the AI is not configured, the file cannot be analysed or the AI call fails:
+    the check is informational and the upload never depends on it."""
+    from .gemini import AIError, ai_client
+    client = ai_client()
+    if client is None:
+        return None
+    try:
+        raw = client.analyse(**payload_for(data, extension))
+        result, _, _ = validate_extraction(raw, float(_cfg("VALIDITY_CONFIDENCE_THRESHOLD", 0.75)))
+    except (UnsupportedDocument, InvalidResponse, AIError):
+        return None
+    except Exception:
+        log.exception("Unexpected error while checking a file before upload")
+        return None
+    _remember_precheck(hashlib.sha256(data).hexdigest(), raw)
+    return result
 
 
 def _requester_can_view(job, doc, version):
@@ -347,6 +398,35 @@ def _set_record_status(doc, version, status):
         record.verified_at = None
 
 
+def _warn_if_expired_on_upload(job, doc, version):
+    """Tell the uploader, in the app only (no email), that the document they uploaded had already expired.
+    Only for uploads ("sweep" = an upload the after-commit hook missed), once per version. Informational:
+    the document is saved and processed as usual, and a failure here never affects the analysis result."""
+    if job.trigger not in ("upload", "sweep") or version.created_by_id is None or doc.current_version_id != version.id:
+        return
+    from .notifications import notify
+    from .service import expired_on_upload, get_record
+    try:
+        with db.session.begin_nested():
+            record = get_record(doc.id)
+            if not expired_on_upload(record):
+                return
+            expiry = record.expiry_date.isoformat()
+            notify(version.created_by_id, category="validity", kind="expired_on_upload", severity="warning",
+                   title=f"{doc.name} had already expired when it was uploaded",
+                   message=f"Expiry date: {expiry} (read automatically; please verify it). The document was "
+                           "saved as usual. Please check that you uploaded the right version.",
+                   link=f"/documents/{doc.id}#validity", entity_type="document", entity_id=doc.id,
+                   details={"document_id": doc.id, "document_name": doc.name, "expiry_date": expiry,
+                            "version": version.label},
+                   dedupe_key=f"validity:expired_upload:{version.id}")
+            log_activity("document", "validity_expired_on_upload",
+                         f"'{doc.name}' had already expired when it was uploaded (expiry date {expiry})",
+                         doc.id, entity_name=doc.name, details={"version_id": version.id, "expiry_date": expiry})
+    except Exception:
+        log.exception("Could not create the expired-on-upload warning for document %s", doc.id)
+
+
 def process_job(job_id, owner):
     """Run one claimed job. Returns its final status for this attempt."""
     import json
@@ -398,6 +478,7 @@ def process_job(job_id, owner):
             return "lost"
         analysis = record_analysis("reused", result, status, model=previous.model)
         _apply_result(doc, version, analysis, result, status, reasons)
+        _warn_if_expired_on_upload(job, doc, version)
         db.session.commit()
         log.info("Validity job %s: document %s reused an earlier analysis -> %s", job_id, doc.id, status)
         return "succeeded"
@@ -424,11 +505,13 @@ def process_job(job_id, owner):
         db.session.commit()
         return "queued"
     attempts, max_attempts = job.attempts, job.max_attempts
+    # The same file was checked just before it was uploaded: use that answer (not for a manual re-run).
+    prechecked = None if job.trigger == "manual" else _take_precheck(version.sha256)
     db.session.commit()  # end the read transaction: no transaction stays open during the AI call
 
     error, transient, retry_after = None, True, None
     try:
-        raw = client.analyse(**payload)
+        raw = prechecked or client.analyse(**payload)
         result, status, reasons = validate_extraction(
             raw, float(_cfg("VALIDITY_CONFIDENCE_THRESHOLD", 0.75)))
     except InvalidResponse as exc:
@@ -461,6 +544,7 @@ def process_job(job_id, owner):
                         else "manual review needed"),
                      doc.id, entity_name=doc.name, details={"version_id": version.id, "model": model,
                                                             "verification_status": status})
+        _warn_if_expired_on_upload(job, doc, version)
         db.session.commit()
         log.info("Validity job %s: document %s analysed by %s -> %s", job_id, doc.id, model, status)
         return "succeeded"

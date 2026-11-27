@@ -477,6 +477,14 @@ def _sanitise_html(raw_html, cid_map, inline_url, remote_map=None):
     )
 
 
+_PREVIEW_STYLE = (
+    "body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:14px;"
+    "line-height:1.5;color:#1f2937;margin:16px;word-wrap:break-word}img{max-width:100%;height:auto}"
+    "pre.plain{white-space:pre-wrap;font-family:inherit;margin:0}.empty{color:#6b7280}"
+    ".mail-part+.mail-part{margin-top:12px}"
+)
+
+
 def render_preview_html(record, inline_url, image_url=None):
     """Return a sanitised, self-contained HTML document for the email body.
 
@@ -484,7 +492,86 @@ def render_preview_html(record, inline_url, image_url=None):
     ``inline_url(part_index)`` builds the URL used for ``cid:`` inline images. Attached files are
     never rendered in the body; the API lists them separately with name, type and size only.
     """
+    body_html = _body_html(load_message(record), record, inline_url, image_url)
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'><base target='_blank'>"
+        f"<style>{_PREVIEW_STYLE}</style>"
+        f"</head><body>{body_html}</body></html>"
+    )
+
+
+def _format_size(size):
+    size = float(size or 0)
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{int(size)} {unit}" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
+_DOWNLOAD_STYLE = (
+    ".mail-head{border-bottom:1px solid #e5e7eb;padding-bottom:12px;margin-bottom:16px}"
+    ".mail-head h1{font-size:20px;font-weight:600;margin:0 0 8px}"
+    ".mail-head table{border-collapse:collapse}.mail-head th{text-align:left;color:#6b7280;font-weight:normal;"
+    "padding:1px 12px 1px 0;vertical-align:top;white-space:nowrap}.mail-head td{padding:1px 0}"
+    ".mail-attachments{border-top:1px solid #e5e7eb;margin-top:20px;padding-top:12px}"
+    ".mail-attachments h2{font-size:15px;font-weight:600;margin:0 0 8px}"
+    ".mail-attachments ul{margin:0;padding-left:20px}.mail-attachments .size{color:#6b7280}"
+    ".mail-attachments .blocked{color:#b91c1c}"
+)
+
+
+def render_download_html(record, inline_url, image_url, attachment_url):
+    """The email as a standalone .html file: the headers shown in the DMS, the same body as the preview
+    (``render_preview_html``), then an "Attachments" block with one download link per attached file.
+
+    ``attachment_url(part_index)`` must return an absolute URL. Images shown inside the body are not
+    listed. If the message was flagged as malware the files are named without links (downloads are blocked).
+    """
     msg = load_message(record)
+    body_html = _body_html(msg, record, inline_url, image_url)
+    esc = html.escape
+
+    rows = [("From", record.sender), ("To", record.recipients)]
+    if record.cc:
+        rows.append(("Cc", record.cc))
+    if record.received_at:
+        rows.append(("Date", record.received_at.strftime("%d %b %Y, %H:%M UTC")))
+    head = (f"<div class='mail-head'><h1>{esc(record.subject or '(no subject)')}</h1><table>"
+            + "".join(f"<tr><th>{esc(k)}</th><td>{esc(v or '')}</td></tr>" for k, v in rows)
+            + "</table></div>")
+
+    inline = inline_part_indexes(msg)
+    files = [a for a in record.attachments if a.part_index not in inline]
+    attachments = ""
+    if files:
+        infected = record.scan_status == "infected"
+        items = []
+        for a in files:
+            name, size = esc(a.filename), f" <span class='size'>({_format_size(a.size)})</span>"
+            if infected:
+                items.append(f"<li>{name}{size}</li>")
+            else:
+                link = esc(attachment_url(a.part_index), quote=True)
+                items.append(f"<li><a href=\"{link}\" rel=\"noopener noreferrer\">{name}</a>{size}</li>")
+        note = ("<p class='blocked'>Malware was detected in this message: its attachments cannot be "
+                "downloaded.</p>" if infected else "")
+        attachments = (f"<div class='mail-attachments'><h2>Attachments ({len(files)})</h2>{note}"
+                       f"<ul>{''.join(items)}</ul></div>")
+
+    # The same content policy as the preview frame (EMAIL_RENDER_CSP): images are embedded as data: URLs,
+    # so nothing (tracking pixels included) is loaded from the internet when the saved file is opened.
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; img-src data:; "
+        "style-src 'unsafe-inline'; font-src data:; form-action 'none'\">"
+        "<base target='_blank'>"
+        f"<title>{esc(record.subject or '(no subject)')}</title>"
+        f"<style>{_PREVIEW_STYLE}{_DOWNLOAD_STYLE}</style>"
+        f"</head><body>{head}{body_html}{attachments}</body></html>"
+    )
+
+
+def _body_html(msg, record, inline_url, image_url=None):
     parts = body_parts(msg)
     cid_map = _inline_map(msg, _html_texts(parts))
     remote_map = None
@@ -505,15 +592,7 @@ def render_preview_html(record, inline_url, image_url=None):
         body_html = chunks[0]
     else:
         body_html = '<p class="empty">This message has no readable text body.</p>'
-
-    return (
-        "<!doctype html><html><head><meta charset='utf-8'><base target='_blank'>"
-        "<style>body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:14px;"
-        "line-height:1.5;color:#1f2937;margin:16px;word-wrap:break-word}img{max-width:100%;height:auto}"
-        "pre.plain{white-space:pre-wrap;font-family:inherit;margin:0}.empty{color:#6b7280}"
-        ".mail-part+.mail-part{margin-top:12px}</style>"
-        f"</head><body>{body_html}</body></html>"
-    )
+    return body_html
 
 
 # ------------------------------------------------------------------- sharing (Permissions Matrix 5)

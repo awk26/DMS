@@ -5,8 +5,8 @@ from ..models import Document, Folder
 
 
 def can_manage_trashed(item, actor, permission_resolver):
-    # Permissions Matrix 6: owners see (and may restore) their own deleted items; administrators see
-    # every deleted item and are the only ones who can purge.
+    # Permissions Matrix 6: owners see their own deleted items, may restore them (within the retention
+    # window) and permanently delete them (policy "item.purge"); administrators see every deleted item.
     return permission_resolver.is_admin or item.owner_id == actor.id
 
 

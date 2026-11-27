@@ -21,7 +21,7 @@ from flask import current_app
 from sqlalchemy import select
 
 from ..extensions import db
-from ..models import Folder, User, utcnow
+from ..models import DocumentVersion, Folder, User, utcnow
 from ..services.activity import diff, log_activity
 from ..validation import ValidationError
 from . import clock
@@ -159,6 +159,15 @@ def set_folder_mode(folder, mode, user, analyse_existing=False):
 def get_record(doc_id):
     return db.session.execute(select(DocumentValidity).where(
         DocumentValidity.document_id == doc_id)).scalar_one_or_none()
+
+
+def expired_on_upload(record):
+    """True when the record's expiry date was already in the past on the business day its version was
+    uploaded (an "already expired" document). Informational only: nothing else depends on it."""
+    if record is None or record.expiry_date is None or record.version_id is None:
+        return False
+    version = db.session.get(DocumentVersion, record.version_id)
+    return version is not None and record.expiry_date < clock.local_date(version.created_at)
 
 
 def ensure_record(doc):
@@ -539,9 +548,8 @@ def summary(doc, record, today=None):
         if verified or record.expiry_date else None
     left = (record.expiry_date - today).days if record.expiry_date else None
     accepted = bool(left is not None and left < 0 and applicable_exceptions(doc.id, today))
-    notice = notice_for(record.expiry_date, today, start_days()) if verified and record.has_expiry else None
-    active_alerts = bool(folder_on and state == "active" and notice is not None
-                         and not (accepted and notice.days_left < 0) and doc.deleted_at is None)
+    notice = notice_for(record.expiry_date, today) if verified and record.has_expiry else None
+    active_alerts = bool(folder_on and state == "active" and notice is not None and doc.deleted_at is None)
     return {
         "tracked": True, "folder_monitoring": folder_on, "monitoring_state": state,
         "paused_until": record.paused_until.isoformat() if record.paused_until and state == "paused" else None,

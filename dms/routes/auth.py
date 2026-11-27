@@ -56,6 +56,31 @@ def _failure():
     return redirect(_frontend_url(auth_error="sso_failed"))
 
 
+def _safe_next(value):
+    """``value`` if it is a page path inside the frontend (e.g. /documents/42), else None.
+
+    Absolute URLs, //host, backslashes and backend paths are refused, so this can never be used to send the
+    browser to another site (open redirect) or straight back into /auth/login.
+    """
+    value = (value or "").strip()
+    if (not value.startswith("/") or value.startswith("//") or "\\" in value or len(value) > 1000
+            or value.startswith(("/auth/", "/api/"))):
+        return None
+    return value
+
+
+def _after_login_url(relay_state):
+    """Where to send the browser after a successful sign-in: the page the user asked for (carried through
+    the identity provider as RelayState by /auth/login?next=...), otherwise the frontend home."""
+    path = _safe_next(relay_state)
+    if path is None:
+        return _frontend_url()
+    parsed = urlsplit(current_app.config.get("ANGULAR_FRONTEND_URL") or "")
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
+    return path
+
+
 def _consume_once(assertion_id, not_on_or_after):
     """True the first time an assertion id is seen; False if it is replayed."""
     now = time.time()
@@ -108,11 +133,16 @@ def _auth():
 
 @bp.get("/login")
 def login():
-    """Start single sign-on: redirect the browser to the identity provider."""
+    """Start single sign-on: redirect the browser to the identity provider.
+
+    ``?next=/some/page`` (optional) is sent as RelayState so the user lands on that page after sign-in.
+    """
     if not enabled():
         abort(404)
+    next_path = _safe_next(request.args.get("next"))
     try:
-        return redirect(_auth().login())
+        auth = _auth()
+        return redirect(auth.login(return_to=next_path) if next_path else auth.login())
     except Exception:
         log.exception("Could not start SAML sign-in")
         return _failure()
@@ -176,7 +206,7 @@ def acs():
         return redirect(_frontend_url(auth_error=problem))
     if not session.get("mfa_ok"):
         return redirect(_frontend_url(mfa_required="1"))
-    return redirect(_frontend_url())
+    return redirect(_after_login_url(request.form.get("RelayState")))
 
 
 @bp.get("/logout")

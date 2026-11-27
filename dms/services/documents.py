@@ -769,21 +769,40 @@ def restore_document(doc, commit=True, user=None):
     return doc
 
 
+def _purge_extra_files(doc_id, shas):
+    """Storage keys that belong only to this document besides its versions: evidence files of validity
+    exceptions, and cached preview renditions (keyed by content hash) no other document still uses."""
+    from ..validity.models import ValidityException
+    keys = [k for k in db.session.execute(select(ValidityException.evidence_storage_key).where(
+        ValidityException.document_id == doc_id, ValidityException.evidence_storage_key.is_not(None))).scalars()]
+    if shas:
+        shared = set(db.session.execute(select(DocumentVersion.sha256).where(
+            DocumentVersion.sha256.in_(shas), DocumentVersion.document_id != doc_id)).scalars())
+        keys += [f"renditions/{sha}.pdf" for sha in sorted(shas - shared)]
+    return keys
+
+
 def purge_document(doc, commit=True, reason=None):
-    """Permanently delete a trashed document and every stored version."""
+    """Permanently delete a trashed document from everywhere: its database rows (versions, shares,
+    favourites, search entry, notifications; validity records cascade) and every stored file (all
+    versions, validity evidence, preview renditions). The audit trail is kept."""
     if doc.deleted_at is None:
         raise ValidationError("Only documents in the recycle bin can be permanently deleted.")
     from .access import delete_entries_for
     from ..models import Favourite
+    from ..validity.models import Notification
     keys = [v.storage_key for v in doc.versions]
     version_ids = [v.id for v in doc.versions]
     name, folder, doc_id = doc.name, doc.folder, doc.id
+    keys += _purge_extra_files(doc_id, {v.sha256 for v in doc.versions if v.sha256})
     doc.current_version = None
     db.session.flush()
     delete_entries_for("document", [doc_id])
     delete_entries_for("version", version_ids)
     db.session.query(Favourite).filter(Favourite.target_type == "document", Favourite.target_id == doc_id
                                        ).delete(synchronize_session=False)
+    db.session.query(Notification).filter(Notification.entity_type == "document", Notification.entity_id == doc_id
+                                          ).delete(synchronize_session=False)
     search.remove("document", doc_id)
     log_folder(folder, "document_purged", document=name)
     log_activity("document", "purged", f"Permanently deleted '{name}'" + (f" ({reason})" if reason else ""),
@@ -797,7 +816,11 @@ def purge_document(doc, commit=True, reason=None):
 
 
 def delete_stored(keys):
-    """Remove stored files (call only after the deleting transaction committed)."""
+    """Remove stored files (call only after the deleting transaction committed). One file that cannot be
+    removed (e.g. a permission problem) is logged and does not stop the others."""
     storage = get_storage()
     for key in keys:
-        storage.delete(key)
+        try:
+            storage.delete(key)
+        except OSError:
+            log.warning("Could not delete stored file %s; remove it by hand", key, exc_info=True)

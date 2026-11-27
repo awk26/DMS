@@ -4,11 +4,10 @@ The DMS had no notification framework, so this one is generic (``category`` name
 module) and can be reused. Producers call ``notify``; uniqueness of (user, dedupe_key) is enforced by
 the database, so a notice is created at most once however many scheduler instances run.
 
-Email (optional, SMTP_HOST): each user chooses ``off``, ``milestones`` (default: one digest on days
-with a milestone notice: 30/15/7/3/1/0 days left, the first overdue day, then weekly) or ``daily``
-(one digest every day with notices). Never more than one email per user per run; failed sends are
-retried with backoff. Access is re-checked when listing and when sending, so a user who lost access
-to a document no longer sees or receives anything about it.
+Email (optional, SMTP_HOST): each user chooses ``off``, ``milestones`` or ``daily``. Validity alerts
+are created only at 30/15/7/3/2/1/0 days left, so both email modes follow those dates. Never more than
+one email per user per run; failed sends are retried with backoff. Access is re-checked when listing
+and when sending, so a user who lost access to a document no longer sees or receives anything about it.
 """
 import json
 import logging

@@ -81,14 +81,15 @@ def register(app):
         from . import clock
         from .models import DocumentValidity
         from .rules import effective_state, notice_for
-        from .service import applicable_exceptions, enabled_folders, recipients, start_days
+        from .service import enabled_folders, recipients
         today = date.fromisoformat(run_date) if run_date else clock.today()
-        enabled, start = enabled_folders(), start_days()
+        enabled = enabled_folders()
         rows = db.session.execute(select(DocumentValidity, Document).join(
             Document, Document.id == DocumentValidity.document_id).order_by(Document.id)).all()
-        click.echo(f"Business date {today}; notices from {start} days before expiry; {len(rows)} tracked document(s).")
+        click.echo(f"Business date {today}; alert milestones: 30, 15, 7, 3, 2, 1, 0 days left; "
+                   f"{len(rows)} tracked document(s).")
         for record, doc in rows:
-            notice = notice_for(record.expiry_date, today, start) if record.expiry_date else None
+            notice = notice_for(record.expiry_date, today) if record.expiry_date else None
             state = effective_state(record.monitoring_state, record.paused_until, today)
             reasons = []
             if doc.deleted_at is not None:
@@ -104,9 +105,10 @@ def register(app):
             if not record.has_expiry or not record.expiry_date:
                 reasons.append("no expiry date")
             elif notice is None:
-                reasons.append(f"expiry {record.expiry_date} is more than {start} days away")
-            elif notice.days_left < 0 and applicable_exceptions(doc.id, today):
-                reasons.append("an acceptance exception applies")
+                if record.expiry_date < today:
+                    reasons.append("expiry has passed; alerts stop after day 0")
+                else:
+                    reasons.append("today is not a scheduled alert milestone")
             if not reasons and not recipients(doc):
                 reasons.append("nobody receives its alerts (owner unfollowed or lost access)")
             verdict = f"NOTICE: {notice.phrase()}" if not reasons else "no notice: " + "; ".join(reasons)

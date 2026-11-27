@@ -9,7 +9,9 @@ denied (section 1):
 3. Administrator: allow, and write an audit entry when the administrator would not have been allowed
    as an ordinary user ("admin override").
 4. Owner: every owner action. Restore from the recycle bin only within the retention window; a folder
-   can be deleted (or moved) only when it holds none of someone else's items. Purge is Admin only.
+   can be deleted (or moved) only when it holds none of someone else's items. Purge (permanent delete)
+   of the owner's own items once they are in the recycle bin, at any time; a folder only when nothing
+   inside it (deleted or not) belongs to someone else - such a folder is purged by an administrator.
 5. Share grant on the item or a folder above it: the actions of that level (section 2).
 6. Otherwise deny; endpoints answer 404 (not 403) when the user may not even see the item.
 
@@ -38,9 +40,10 @@ OWNER_ACTIONS = {
     "item.version.restore", "item.rename", "item.move", "item.copy", "item.delete", "item.restore",
     "item.share",
 }
-ADMIN_ONLY_ITEM_ACTIONS = {"item.purge"}
+# Permanent delete: Admin, or the owner of an item that is in the recycle bin (see ``decide``).
+PURGE_ACTIONS = {"item.purge"}
 HOLD_BLOCKED = {"item.delete", "item.purge", "item.move"}
-ITEM_ACTIONS = set(SHARE_ACTIONS) | OWNER_ACTIONS | ADMIN_ONLY_ITEM_ACTIONS
+ITEM_ACTIONS = set(SHARE_ACTIONS) | OWNER_ACTIONS | PURGE_ACTIONS
 
 # System actions: who may perform them, independent of any item.
 EVERY_USER_ACTIONS = {"email.link", "email.unlink", "email.archive"}
@@ -53,6 +56,9 @@ MESSAGES = {
     "foreign": "This folder holds items that belong to other people, so it cannot be {verb}. "
                "Ask them (or an administrator) to move their items out first.",
     "window": "The recycle bin retention period for this item has ended; ask an administrator.",
+    "purge": "Only the owner or an administrator can permanently delete this item, and only from the recycle bin.",
+    "foreign_purge": "This folder holds items that belong to other people, so only an administrator can "
+                     "permanently delete it.",
     "level": "Your access level does not allow this.",
     "inactive": "Your account is not active.",
 }
@@ -107,16 +113,17 @@ def under_hold(item):
                                                         Document.legal_hold.is_(True)).limit(1)).first() is not None
 
 
-def foreign_items(folder, uid):
-    """Live folders and documents inside ``folder`` (itself included) that ``uid`` does not own."""
+def foreign_items(folder, uid, include_deleted=False):
+    """Folders and documents inside ``folder`` (itself included) that ``uid`` does not own: live ones
+    only, or also those in the recycle bin with ``include_deleted``."""
     ids = _subtree_ids(folder)
-    folders = db.session.execute(select(Folder).where(
-        Folder.id.in_(ids), Folder.deleted_at.is_(None),
-        (Folder.owner_id.is_(None)) | (Folder.owner_id != uid))).scalars().all()
-    docs = db.session.execute(select(Document).where(
-        Document.folder_id.in_(ids), Document.deleted_at.is_(None),
-        (Document.owner_id.is_(None)) | (Document.owner_id != uid))).scalars().all()
-    return folders + docs
+    folder_q = select(Folder).where(Folder.id.in_(ids), (Folder.owner_id.is_(None)) | (Folder.owner_id != uid))
+    doc_q = select(Document).where(Document.folder_id.in_(ids),
+                                   (Document.owner_id.is_(None)) | (Document.owner_id != uid))
+    if not include_deleted:
+        folder_q = folder_q.where(Folder.deleted_at.is_(None))
+        doc_q = doc_q.where(Document.deleted_at.is_(None))
+    return db.session.execute(folder_q).scalars().all() + db.session.execute(doc_q).scalars().all()
 
 
 def within_retention(item):
@@ -143,8 +150,14 @@ def decide(res, action, item=None):
         return False, "hold"
     if res.is_admin:
         return True, None
-    if action in ADMIN_ONLY_ITEM_ACTIONS:
-        return False, "admin"
+    if action in PURGE_ACTIONS:
+        # The owner may permanently delete their own item, but only once it is in the recycle bin
+        # (before or after the retention window), and a folder only when everything inside it is theirs.
+        if item is None or getattr(item, "deleted_at", None) is None or not res.owns(item):
+            return False, "purge"
+        if isinstance(item, Folder) and foreign_items(item, res.uid, include_deleted=True):
+            return False, "foreign_purge"
+        return True, None
     if item is None:
         # The top level of the library: only folder creation/upload, through a repository grant.
         if action in ("folder.create_child", "folder.upload", "item.view"):
@@ -176,7 +189,7 @@ def actions_for(item, res=None):
     """The item actions the current user may perform on ``item`` (for the user interface)."""
     from .permissions import resolver
     res = res or resolver()
-    keys = SHARE_ACTIONS.keys() | OWNER_ACTIONS | ADMIN_ONLY_ITEM_ACTIONS
+    keys = SHARE_ACTIONS.keys() | OWNER_ACTIONS | PURGE_ACTIONS
     if not isinstance(item, Folder) and item is not None:
         keys = {k for k in keys if not k.startswith("folder.")}
     return sorted(k for k in keys if decide(res, k, item)[0])

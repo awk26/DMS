@@ -60,6 +60,11 @@ def scheduled_time():
     return parse_hhmm(raw)
 
 
+def local_date(utc_moment, tz=None):
+    """The business date of a naive UTC timestamp from the database."""
+    return utc_moment.replace(tzinfo=timezone.utc).astimezone(tz or zone()).date()
+
+
 def utc_naive(moment):
     """Naive UTC datetime (how the database stores timestamps)."""
     return moment.astimezone(timezone.utc).replace(tzinfo=None)
